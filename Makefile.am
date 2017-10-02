@@ -531,6 +531,12 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/victor-dmm/protocol.c \
 	src/hardware/victor-dmm/api.c
 endif
+if HW_VLLOGIC
+src_libdrivers_la_SOURCES += \
+	src/hardware/vllogic/protocol.h \
+	src/hardware/vllogic/protocol.c \
+	src/hardware/vllogic/api.c
+endif
 if HW_YOKOGAWA_DLM
 src_libdrivers_la_SOURCES += \
 	src/hardware/yokogawa-dlm/protocol.h \

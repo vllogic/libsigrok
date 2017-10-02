@@ -1,0 +1,506 @@
+/*
+ * This file is part of the libsigrok project.
+ *
+ * Copyright (C) 2016 Talpa Chen <talpachen@gmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <config.h>
+#include <string.h>
+#include "protocol.h"
+
+#define VLLOGIC_REQUESET_REG_RW				0x00
+
+static int read_registers(struct sr_usb_dev_inst *usb, uint16_t addr, uint16_t len, uint32_t *data)
+{
+	int ret;
+	ret = libusb_control_transfer(usb->devhdl, LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_ENDPOINT_IN | LIBUSB_RECIPIENT_INTERFACE,
+		VLLOGIC_REQUESET_REG_RW, addr, VLLOGIC_INTERFACE, (uint8_t *)data, len, USB_TIMEOUT_MS);
+	if (ret != len)
+		return SR_ERR;
+	else
+		return SR_OK;
+}
+
+static int write_registers(struct sr_usb_dev_inst *usb, uint16_t addr, uint16_t len, uint32_t *data)
+{
+	int ret;
+	ret = libusb_control_transfer(usb->devhdl, LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_ENDPOINT_OUT | LIBUSB_RECIPIENT_INTERFACE,
+		VLLOGIC_REQUESET_REG_RW, addr, VLLOGIC_INTERFACE, (uint8_t *)data, len, USB_TIMEOUT_MS);
+
+	if (ret != len)
+		return SR_ERR;
+	else
+		return SR_OK;
+}
+
+static int version_check(uint32_t version)
+{
+	switch (version & 0xff000000)
+	{
+	case VLLOGIC_VERSION_SCHEME_LPC43XX:
+		sr_spew("Find VLLOGIC_VERSION_SCHEME_LPC43XX.");
+		switch (version & 0x00ff0000)
+		{
+		case VLLOGIC_BOARD_VL1602ED:
+			sr_spew("Find VLLOGIC_BOARD_VL1602ED.");
+			break;
+		case VLLOGIC_BOARD_VL1602:
+			sr_spew("Find VLLOGIC_BOARD_VL1602.");
+			break;
+		default:
+			sr_spew("Cannot Match Board");
+			return -1;
+		}
+		break;
+	default:
+		sr_spew("Cannot Match Scheme");
+		return -1;
+	}
+	return 0;
+}
+
+SR_PRIV struct dev_context *vll_new_device(struct drv_context *drvc, struct sr_usb_dev_inst *usb)
+{
+	int i, ret;
+	uint32_t version;
+	struct dev_context *devc;
+
+	(void)drvc;
+
+	sr_spew("vll_new_device version check.");
+	// device version check
+	ret = read_registers(usb, 0, 4, &version);
+	if (ret != SR_OK)
+		return NULL;
+
+	ret = version_check(version);
+	if (ret < 0)
+		return NULL;
+
+	sr_spew("vll_new_device create new device.");
+	// create new device
+	devc = g_malloc0(sizeof(struct dev_context));
+	memset(devc, 0, sizeof(struct dev_context));
+
+	switch (version & 0xff000000)
+	{
+	case VLLOGIC_VERSION_SCHEME_LPC43XX:
+		memcpy(devc->vendor, "Vllogic", sizeof("Vllogic"));
+		switch (version & 0x00ff0000)
+		{
+		case VLLOGIC_BOARD_VL1602ED:
+			memcpy(devc->model, "VL1602ED", sizeof("VL1602ED"));
+			break;
+		case VLLOGIC_BOARD_VL1602:
+			memcpy(devc->model, "VL1602", sizeof("VL1602"));
+			break;
+		}
+		break;
+	}
+
+	sr_spew("vll_new_device read regs.");
+	ret = read_registers(usb, 0, sizeof(struct lpc43xx_registers_list_t) - sizeof(struct vllogic_in_pkt_info_t),
+		(uint32_t *)&devc->lpc43xx_registers);
+	if (ret != SR_OK) {
+		g_free(devc);
+		return NULL;
+	}
+
+	for (i = 0; i < 16; i++)
+	{
+		if (devc->lpc43xx_registers.board_in_channels_mask & (0x1ul << i))
+		{
+			devc->digital_channel_num++;
+		}
+	}
+	sr_spew("vll_new_device get digital channel: %d", devc->digital_channel_num);
+
+	for (i = 16; i < 32; i++)
+	{
+		if (devc->lpc43xx_registers.board_in_channels_mask & (0x1ul << i))
+		{
+			devc->analog_channel_num++;
+		}
+	}
+	sr_spew("vll_new_device get analog channel: %d", devc->analog_channel_num);
+
+	return devc;
+}
+
+static void abort_acquisition(struct dev_context *devc)
+{
+	if (devc->acq_aborted == FALSE) {
+		int i;
+		
+		devc->acq_aborted = TRUE;
+
+		for (i = BULK_IN_TRANSFERS_NUM - 1; i >= 0; i--) {
+			if (devc->transfers[i])
+				libusb_cancel_transfer(devc->transfers[i]);
+		}
+	}
+}
+
+static void finish_acquisition(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+
+	std_session_send_df_end(sdi);
+
+	usb_source_remove(sdi->session, devc->ctx);
+
+	g_free(devc->transferbuffer);
+	g_free(devc->convbuffer);
+}
+
+static void free_transfer(struct libusb_transfer *transfer)
+{
+	struct sr_dev_inst *sdi;
+	struct dev_context *devc;
+	int i;
+
+	sdi = transfer->user_data;
+	devc = sdi->priv;
+
+	transfer->buffer = NULL;
+	libusb_free_transfer(transfer);
+
+	for (i = 0; i < BULK_IN_TRANSFERS_NUM; i++) {
+		if (devc->transfers[i] == transfer) {
+			sr_spew("free_transfer: %d.", i);
+			devc->transfers[i] = NULL;
+			break;
+		}
+	}
+
+	devc->submitted_transfers--;
+	if (devc->submitted_transfers == 0)
+		finish_acquisition(sdi);
+}
+
+static void resubmit_transfer(struct libusb_transfer *transfer)
+{
+	int ret;
+
+	if ((ret = libusb_submit_transfer(transfer)) == LIBUSB_SUCCESS)
+		return;
+
+	free_transfer(transfer);
+}
+
+static size_t bytes_per_ms(struct dev_context *devc)
+{
+	return devc->cur_samplerate * devc->digital_channel_select_num / 8000;
+}
+
+static size_t get_buffer_size(struct dev_context *devc)
+{
+	// The buffer should be large enough to hold 10ms of data
+	size_t s = bytes_per_ms(devc) * 10;
+
+	if (s <= 20 * 1024)
+		return 20 * 1024;
+	else
+		return (s / (20 * 1024) + 1) * (20 * 1024);
+}
+
+static int configure_requested_channels(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc;
+	struct sr_channel *ch;
+	GSList *l;
+
+	devc = sdi->priv;
+
+	devc->digital_channel_select_mask = 0;
+	devc->digital_channel_select_num = 0;
+
+	for (l = sdi->channels; l; l = l->next) {
+		ch = (struct sr_channel *)l->data;
+
+		if (ch->enabled == TRUE) {
+			devc->digital_channel_select_mask |= 0x1ul << (ch->index);
+			devc->digital_channel_select_num++;
+		}
+	}
+
+	return SR_OK;
+}
+
+static size_t convert_sample_data(struct dev_context *devc,
+	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
+{
+	uint16_t channel_data[32];
+	uint32_t i, unitsize, unitshift;
+	size_t ret = 0;
+
+	(void)destcnt;
+
+	unitsize = devc->lpc43xx_registers.in_pkt_info.logic_unitbits *
+		devc->lpc43xx_registers.in_pkt_info.logic_unitchs / 8;
+	unitshift = devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8;
+
+	sr_spew("srccnt: %d.", (int)srccnt);
+	sr_spew("unitsize: %d.", unitsize);
+	sr_spew("unitshift: %d.", unitshift);
+
+	srccnt /= unitsize;
+
+	sr_spew("srccnt: %d.", (int)srccnt);
+
+	while (srccnt--) {
+		uint32_t ch, shift;
+
+		for (shift = 0; shift < devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8; shift += 4) {
+			memset(channel_data, 0, 2 * 32);
+			for (ch = 0; ch < devc->lpc43xx_registers.in_pkt_info.logic_unitchs; ch++) {
+				uint32_t sample = *(uint32_t *)(src + unitshift * ch + shift);
+				uint16_t channel_mask = devc->digital_channel_masks[ch];
+				for (i = 0; i < 32; i++, sample >>= 1) {
+					if (sample & 0x1)
+						channel_data[i] |= channel_mask;
+				}
+			}
+			memcpy(dest, channel_data, 2 * 32);
+			dest += 2 * 32;
+			ret += 32;
+		}
+		src += unitsize;
+	}
+	sr_spew("ret: %d.", (int)ret);
+
+	return ret;
+}
+
+static void receive_transfer(struct libusb_transfer *transfer)
+{
+	struct sr_dev_inst *sdi;
+	struct dev_context *devc;
+	gboolean packet_has_error = FALSE;
+	int trigger_offset, cur_sample_count;
+	struct sr_datafeed_packet packet;
+	struct sr_datafeed_logic logic;
+
+	sdi = transfer->user_data;
+	devc = sdi->priv;
+
+	if (devc->acq_aborted) {
+		free_transfer(transfer);
+		return;
+	}
+
+	switch (transfer->status) {
+	case LIBUSB_TRANSFER_NO_DEVICE:
+		abort_acquisition(devc);
+		free_transfer(transfer);
+		return;
+	case LIBUSB_TRANSFER_COMPLETED:
+	case LIBUSB_TRANSFER_TIMED_OUT:
+		break;
+	default:
+		packet_has_error = TRUE;
+		break;
+	}
+
+	if (transfer->actual_length == 0 || packet_has_error) {
+		devc->empty_transfer_count++;
+		if (devc->empty_transfer_count > (BULK_IN_TRANSFERS_NUM * 2)) {
+			sr_err("receive_transfer: %d", devc->empty_transfer_count);
+			abort_acquisition(devc);
+			free_transfer(transfer);
+		}
+		else {
+			resubmit_transfer(transfer);
+		}
+		return;
+	}
+	else {
+		devc->empty_transfer_count = 0;
+	}
+
+	if (devc->trigger_fired) {
+		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
+			cur_sample_count = convert_sample_data(devc, devc->convbuffer,
+				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
+
+			sr_info("actual_length: %d", transfer->actual_length);
+			sr_info("cur_sample_count: %d", cur_sample_count);
+			sr_info("sent_samples: %d", (int)devc->sent_samples);
+
+			if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
+				cur_sample_count = devc->limit_samples - devc->sent_samples;
+
+			packet.type = SR_DF_LOGIC;
+			packet.payload = &logic;
+			logic.unitsize = 2;
+			logic.length = cur_sample_count * logic.unitsize;
+			logic.data = devc->convbuffer;
+			sr_session_send(sdi, &packet);
+			devc->sent_samples += cur_sample_count;
+		}
+	}
+	else {
+		(void)trigger_offset;
+		// TODO
+	}
+
+	if (devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
+		abort_acquisition(devc);
+		free_transfer(transfer);
+	}
+	else
+		resubmit_transfer(transfer);
+}
+
+SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
+{
+	struct sr_usb_dev_inst *usb;
+	struct dev_context *devc;
+	struct libusb_transfer *transfer;
+	uint32_t i, j, status;
+	int ret;
+
+	devc = sdi->priv;
+	usb = sdi->conn;
+
+	configure_requested_channels(sdi);
+
+	// Configure Vllogic paramter
+	devc->lpc43xx_registers.command = VLLOGIC_CMD_CONFIG;
+	devc->lpc43xx_registers.mode = VLLOGIC_MODE_IN;
+	devc->lpc43xx_registers.rate = devc->cur_samplerate;
+	devc->lpc43xx_registers.channels_in_enable_mask =
+		devc->lpc43xx_registers.board_in_channels_mask &
+		devc->digital_channel_select_mask;
+
+	write_registers(usb, 0, sizeof(struct lpc43xx_registers_list_t) - sizeof(struct vllogic_in_pkt_info_t),
+		(uint32_t *)&devc->lpc43xx_registers);
+
+	read_registers(usb, 12, 4, &status);
+
+	if (status == VLLOGIC_STATUS_CONFIG_DONE) {
+		read_registers(usb, 0, sizeof(struct lpc43xx_registers_list_t) - sizeof(struct vllogic_in_pkt_info_t),
+			(uint32_t *)&devc->lpc43xx_registers);
+		read_registers(usb, 44, sizeof(struct vllogic_in_pkt_info_t),
+			(uint32_t *)&devc->lpc43xx_registers.in_pkt_info);
+	}
+	else {
+		sr_spew("vll_start_acquisition config failed, Status: %d.", status);
+		return SR_ERR;
+	}
+
+	sr_spew("pkt_size: %d.", devc->lpc43xx_registers.in_pkt_info.pkt_size);
+	devc->transferbuffer_size = get_buffer_size(devc);
+
+	for (i = 0, j = 0; i < 16; i++) {
+		if (devc->lpc43xx_registers.channels_in_enable_mask & (0x1ul << i))
+			devc->digital_channel_masks[j++] = 0x1ul << i;
+	}
+
+	devc->convbuffer_size = devc->transferbuffer_size * 16 / devc->lpc43xx_registers.in_pkt_info.logic_unitchs + 2 * 32;
+	if (!(devc->convbuffer = g_try_malloc(devc->convbuffer_size))) {
+		sr_err("Conversion buffer malloc failed.");
+		return SR_ERR_MALLOC;
+	}
+	sr_spew("vll_start_acquisition convbuffer_size: %d.", (int)devc->convbuffer_size);
+
+	if (!(devc->transferbuffer = g_try_malloc(devc->transferbuffer_size * BULK_IN_TRANSFERS_NUM))) {
+		sr_err("Transfers buffer malloc failed.");
+		g_free(devc->convbuffer);
+		return SR_ERR_MALLOC;
+	}
+	sr_spew("vll_start_acquisition transferbuffer: %d.", (int)devc->transferbuffer_size * BULK_IN_TRANSFERS_NUM);
+
+	devc->submitted_transfers = 0;
+	memset(devc->transfers, 0, sizeof(struct libusb_transfer *) * BULK_IN_TRANSFERS_NUM);
+
+	for (i = 0; i < BULK_IN_TRANSFERS_NUM; i++) {
+		uint8_t *buf = devc->transferbuffer + devc->transferbuffer_size * i;
+		transfer = libusb_alloc_transfer(0);
+		libusb_fill_bulk_transfer(transfer, usb->devhdl,
+			VLLOGIC_IN_EP | LIBUSB_ENDPOINT_IN, buf, devc->transferbuffer_size,
+			receive_transfer, (void *)sdi, USB_TIMEOUT_MS);
+		if ((ret = libusb_submit_transfer(transfer)) != 0) {
+			sr_err("Failed to submit transfer: %s.", libusb_error_name(ret));
+			libusb_free_transfer(transfer);
+			if (devc->submitted_transfers) {
+				abort_acquisition(devc);
+			}
+			else {
+				g_free(devc->transferbuffer);
+				g_free(devc->convbuffer);
+			}
+			return SR_ERR;
+		}
+		devc->transfers[i] = transfer;
+		devc->submitted_transfers++;
+	}
+
+	return SR_OK;
+}
+
+static int receive_data(int fd, int revents, void *cb_data)
+{
+	struct timeval tv;
+	struct drv_context *drvc;
+
+	(void)fd;
+	(void)revents;
+
+	drvc = (struct drv_context *)cb_data;
+
+	tv.tv_sec = tv.tv_usec = 0;
+	libusb_handle_events_timeout(drvc->sr_ctx->libusb_ctx, &tv);
+
+	return TRUE;
+}
+
+SR_PRIV int vll_start_acquisition(const struct sr_dev_inst *sdi)
+{
+	int ret;
+	struct sr_dev_driver *di = sdi->driver;
+	struct drv_context *drvc = di->context;
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+
+	devc->ctx = drvc->sr_ctx;
+	devc->sent_samples = 0;
+	devc->empty_transfer_count = 0;
+	devc->acq_aborted = FALSE;
+	devc->trigger_fired = TRUE;
+
+	if ((ret = vll_config_acquisition(sdi)) < 0)
+		return ret;
+
+	usb_source_add(sdi->session, devc->ctx, 100, receive_data, drvc);
+	std_session_send_df_header(sdi);
+
+	// Start acquisition
+	devc->lpc43xx_registers.command = VLLOGIC_CMD_START;
+	if (write_registers(usb, 16, 4, &devc->lpc43xx_registers.command) != SR_OK) {
+		abort_acquisition(devc);
+		return SR_ERR;
+	}
+
+	return SR_OK;
+}
+
+SR_PRIV int vll_stop_acquisition(const struct sr_dev_inst *sdi)
+{
+	abort_acquisition(sdi->priv);
+
+	return SR_OK;
+}

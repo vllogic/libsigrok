@@ -274,6 +274,7 @@ SR_DRIVER([Tondaj SL-814], [tondaj-sl-814], [libserialport])
 SR_DRIVER([UNI-T DMM], [uni-t-dmm], [libusb])
 SR_DRIVER([UNI-T UT32x], [uni-t-ut32x], [libusb])
 SR_DRIVER([Victor DMM], [victor-dmm], [libusb])
+SR_DRIVER([Vllogic], [vllogic], [libusb])
 SR_DRIVER([Yokogawa DL/DLM], [yokogawa-dlm])
 SR_DRIVER([ZEROPLUS Logic Cube], [zeroplus-logic-cube], [libusb])
 
