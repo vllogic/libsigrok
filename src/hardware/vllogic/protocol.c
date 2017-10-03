@@ -211,10 +211,8 @@ static size_t get_buffer_size(struct dev_context *devc)
 	// The buffer should be large enough to hold 10ms of data
 	size_t s = bytes_per_ms(devc) * 10;
 
-	if (s <= 20 * 1024)
-		return 20 * 1024;
-	else
-		return (s / (20 * 1024) + 1) * (20 * 1024);
+	s = 10 * bytes_per_ms(devc);
+	return (s + 511) & ~511;
 }
 
 static uint32_t get_timeout(struct dev_context *devc)
@@ -263,14 +261,9 @@ static size_t convert_sample_data(struct dev_context *devc,
 		devc->lpc43xx_registers.in_pkt_info.logic_unitchs / 8;
 	unitshift = devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8;
 
-	//sr_spew("srccnt: %d.", (int)srccnt);
-	//sr_spew("unitsize: %d.", unitsize);
-	//sr_spew("unitshift: %d.", unitshift);
-
 	srccnt /= unitsize;
 
-	//sr_spew("srccnt: %d.", (int)srccnt);
-
+#if 0
 	while (srccnt--) {
 		uint32_t ch, shift;
 
@@ -290,7 +283,9 @@ static size_t convert_sample_data(struct dev_context *devc,
 		}
 		src += unitsize;
 	}
-	//sr_spew("ret: %d.", (int)ret);
+#else
+	ret = srccnt * devc->lpc43xx_registers.in_pkt_info.logic_unitbits;
+#endif
 
 	return ret;
 }
@@ -343,12 +338,9 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
-#if 0
 			cur_sample_count = convert_sample_data(devc, devc->convbuffer,
 				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
-#else
-			cur_sample_count = 1 * 1024;
-#endif
+
 			//sr_info("actual_length: %d", transfer->actual_length);
 			//sr_info("cur_sample_count: %d", cur_sample_count);
 			//sr_info("sent_samples: %d", (int)devc->sent_samples);
