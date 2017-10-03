@@ -343,9 +343,12 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
+#if 0
 			cur_sample_count = convert_sample_data(devc, devc->convbuffer,
 				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
-
+#else
+			cur_sample_count = 1 * 1024;
+#endif
 			//sr_info("actual_length: %d", transfer->actual_length);
 			//sr_info("cur_sample_count: %d", cur_sample_count);
 			//sr_info("sent_samples: %d", (int)devc->sent_samples);
@@ -368,6 +371,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	}
 
 	if (devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
+		sr_info("devc->sent_samples: %d", (int)transfer->sent_samples);
 		abort_acquisition(devc);
 		free_transfer(transfer);
 	}
@@ -427,6 +431,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 	}
 
 	timeout = get_timeout(devc);
+	sr_spew("timeout: %d.", timeout);
 	devc->submitted_transfers = 0;
 	memset(devc->transfers, 0, sizeof(struct libusb_transfer *) * BULK_IN_TRANSFERS_NUM);
 
