@@ -263,7 +263,7 @@ static size_t convert_sample_data(struct dev_context *devc,
 
 	srccnt /= unitsize;
 
-#if 0
+#if 1
 	while (srccnt--) {
 		uint32_t ch, shift;
 
@@ -353,7 +353,9 @@ static void receive_transfer(struct libusb_transfer *transfer)
 			logic.unitsize = 2;
 			logic.length = cur_sample_count * logic.unitsize;
 			logic.data = devc->convbuffer;
+#if 1
 			sr_session_send(sdi, &packet);
+#endif
 			devc->sent_samples += cur_sample_count;
 		}
 	}
