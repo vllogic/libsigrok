@@ -411,7 +411,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 
 	devc->transferbuffer_size = get_buffer_size(devc);
 	devc->convbuffer_size = devc->transferbuffer_size * 16 / devc->lpc43xx_registers.in_pkt_info.logic_unitchs + 2 * 32;
-	if (!(devc->convbuffer = g_try_malloc(convsize))) {
+	if (!(devc->convbuffer = g_try_malloc(devc->convbuffer_size))) {
 		sr_err("Conversion buffer malloc failed.");
 		return SR_ERR_MALLOC;
 	}
