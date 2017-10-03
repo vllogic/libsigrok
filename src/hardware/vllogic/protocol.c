@@ -371,7 +371,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	}
 
 	if (devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
-		sr_info("devc->sent_samples: %d", (int)transfer->sent_samples);
+		sr_info("devc->sent_samples: %d", (int)devc->sent_samples);
 		abort_acquisition(devc);
 		free_transfer(transfer);
 	}
