@@ -253,13 +253,13 @@ static size_t convert_sample_data(struct dev_context *devc,
 		devc->lpc43xx_registers.in_pkt_info.logic_unitchs / 8;
 	unitshift = devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8;
 
-	sr_spew("srccnt: %d.", (int)srccnt);
-	sr_spew("unitsize: %d.", unitsize);
-	sr_spew("unitshift: %d.", unitshift);
+	//sr_spew("srccnt: %d.", (int)srccnt);
+	//sr_spew("unitsize: %d.", unitsize);
+	//sr_spew("unitshift: %d.", unitshift);
 
 	srccnt /= unitsize;
 
-	sr_spew("srccnt: %d.", (int)srccnt);
+	//sr_spew("srccnt: %d.", (int)srccnt);
 
 	while (srccnt--) {
 		uint32_t ch, shift;
@@ -280,7 +280,7 @@ static size_t convert_sample_data(struct dev_context *devc,
 		}
 		src += unitsize;
 	}
-	sr_spew("ret: %d.", (int)ret);
+	//sr_spew("ret: %d.", (int)ret);
 
 	return ret;
 }
@@ -336,9 +336,9 @@ static void receive_transfer(struct libusb_transfer *transfer)
 			cur_sample_count = convert_sample_data(devc, devc->convbuffer,
 				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
 
-			sr_info("actual_length: %d", transfer->actual_length);
-			sr_info("cur_sample_count: %d", cur_sample_count);
-			sr_info("sent_samples: %d", (int)devc->sent_samples);
+			//sr_info("actual_length: %d", transfer->actual_length);
+			//sr_info("cur_sample_count: %d", cur_sample_count);
+			//sr_info("sent_samples: %d", (int)devc->sent_samples);
 
 			if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
 				cur_sample_count = devc->limit_samples - devc->sent_samples;
