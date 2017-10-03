@@ -144,16 +144,13 @@ struct dev_context
 	int64_t sent_samples;
 
 	int empty_transfer_count;
-
-	struct sr_context *ctx;
-	struct libusb_transfer *transfers[BULK_IN_TRANSFERS_NUM];
-	//int32_t num_transfers;
+	
 	int32_t submitted_transfers;
-	uint8_t *transferbuffer;
+	struct libusb_transfer *transfers[BULK_IN_TRANSFERS_NUM];
 	size_t transferbuffer_size;
-
 	uint8_t *convbuffer;
 	size_t convbuffer_size;
+
 
 	uint16_t digital_channel_masks[16];
 
@@ -164,6 +161,8 @@ struct dev_context
 	uint32_t analog_channel_select_mask;
 	uint32_t analog_channel_select_num;
 	uint32_t analog_channel_num;
+
+	struct sr_context *ctx;
 };
 
 SR_PRIV struct dev_context *vll_new_device(struct drv_context *drvc, struct sr_usb_dev_inst *usb);

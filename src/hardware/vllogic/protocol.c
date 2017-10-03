@@ -162,7 +162,6 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 
 	usb_source_remove(sdi->session, devc->ctx);
 
-	g_free(devc->transferbuffer);
 	g_free(devc->convbuffer);
 }
 
@@ -175,6 +174,7 @@ static void free_transfer(struct libusb_transfer *transfer)
 	sdi = transfer->user_data;
 	devc = sdi->priv;
 
+	g_free(transfer->buffer);
 	transfer->buffer = NULL;
 	libusb_free_transfer(transfer);
 
@@ -403,32 +403,33 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 	}
 
 	sr_spew("pkt_size: %d.", devc->lpc43xx_registers.in_pkt_info.pkt_size);
-	devc->transferbuffer_size = get_buffer_size(devc);
-
+	
 	for (i = 0, j = 0; i < 16; i++) {
 		if (devc->lpc43xx_registers.channels_in_enable_mask & (0x1ul << i))
 			devc->digital_channel_masks[j++] = 0x1ul << i;
 	}
 
+	devc->transferbuffer_size = get_buffer_size(devc);
 	devc->convbuffer_size = devc->transferbuffer_size * 16 / devc->lpc43xx_registers.in_pkt_info.logic_unitchs + 2 * 32;
-	if (!(devc->convbuffer = g_try_malloc(devc->convbuffer_size))) {
+	if (!(devc->convbuffer = g_try_malloc(convsize))) {
 		sr_err("Conversion buffer malloc failed.");
 		return SR_ERR_MALLOC;
 	}
-	sr_spew("vll_start_acquisition convbuffer_size: %d.", (int)devc->convbuffer_size);
-
-	if (!(devc->transferbuffer = g_try_malloc(devc->transferbuffer_size * BULK_IN_TRANSFERS_NUM))) {
-		sr_err("Transfers buffer malloc failed.");
-		g_free(devc->convbuffer);
-		return SR_ERR_MALLOC;
-	}
-	sr_spew("vll_start_acquisition transferbuffer: %d.", (int)devc->transferbuffer_size * BULK_IN_TRANSFERS_NUM);
 
 	devc->submitted_transfers = 0;
 	memset(devc->transfers, 0, sizeof(struct libusb_transfer *) * BULK_IN_TRANSFERS_NUM);
 
 	for (i = 0; i < BULK_IN_TRANSFERS_NUM; i++) {
-		uint8_t *buf = devc->transferbuffer + devc->transferbuffer_size * i;
+		uint8_t *buf;
+		if (!(buf = g_try_malloc(devc->transferbuffer_size))) {
+			sr_err("USB transfer buffer malloc failed.");
+			if (devc->submitted_transfers)
+				abort_acquisition(devc);
+			else {
+				g_free(devc->convbuffer);
+			}
+			return SR_ERR_MALLOC;
+		}
 		transfer = libusb_alloc_transfer(0);
 		libusb_fill_bulk_transfer(transfer, usb->devhdl,
 			VLLOGIC_IN_EP | LIBUSB_ENDPOINT_IN, buf, devc->transferbuffer_size,
@@ -436,13 +437,8 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		if ((ret = libusb_submit_transfer(transfer)) != 0) {
 			sr_err("Failed to submit transfer: %s.", libusb_error_name(ret));
 			libusb_free_transfer(transfer);
-			if (devc->submitted_transfers) {
-				abort_acquisition(devc);
-			}
-			else {
-				g_free(devc->transferbuffer);
-				g_free(devc->convbuffer);
-			}
+			g_free(buf);
+			abort_acquisition(devc);
 			return SR_ERR;
 		}
 		devc->transfers[i] = transfer;
