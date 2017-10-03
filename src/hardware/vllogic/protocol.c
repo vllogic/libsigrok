@@ -217,6 +217,16 @@ static size_t get_buffer_size(struct dev_context *devc)
 		return (s / (20 * 1024) + 1) * (20 * 1024);
 }
 
+static uint32_t get_timeout(struct dev_context *devc)
+{
+	size_t total_size;
+	unsigned int timeout;
+
+	total_size = get_buffer_size(devc) * BULK_IN_TRANSFERS_NUM;
+	timeout = total_size / bytes_per_ms(devc);
+	return timeout + timeout / 4; /* Leave a headroom of 25% percent. */
+}
+
 static int configure_requested_channels(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
@@ -370,7 +380,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 	struct sr_usb_dev_inst *usb;
 	struct dev_context *devc;
 	struct libusb_transfer *transfer;
-	uint32_t i, j, status;
+	uint32_t i, j, status, timeout;
 	int ret;
 
 	devc = sdi->priv;
@@ -416,6 +426,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		return SR_ERR_MALLOC;
 	}
 
+	timeout = get_timeout(devc);
 	devc->submitted_transfers = 0;
 	memset(devc->transfers, 0, sizeof(struct libusb_transfer *) * BULK_IN_TRANSFERS_NUM);
 
@@ -433,7 +444,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		transfer = libusb_alloc_transfer(0);
 		libusb_fill_bulk_transfer(transfer, usb->devhdl,
 			VLLOGIC_IN_EP | LIBUSB_ENDPOINT_IN, buf, devc->transferbuffer_size,
-			receive_transfer, (void *)sdi, USB_TIMEOUT_MS);
+			receive_transfer, (void *)sdi, timeout);
 		if ((ret = libusb_submit_transfer(transfer)) != 0) {
 			sr_err("Failed to submit transfer: %s.", libusb_error_name(ret));
 			libusb_free_transfer(transfer);
