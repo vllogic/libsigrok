@@ -248,10 +248,10 @@ static int configure_requested_channels(const struct sr_dev_inst *sdi)
 }
 
 static size_t convert_sample_logic_u8(struct dev_context *devc,
-	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
+	uint8_t *dest, const uint8_t *src, size_t srccnt)
 {
 	size_t ret = 0;
-	int ch, byte, bit;
+	uint32_t ch, byte, bit;
 	uint8_t channel_data[256];
 	uint16_t *ch_masks = devc->digital_channel_masks;
 	uint32_t ch_num = devc->digital_channel_num;
@@ -278,7 +278,7 @@ static size_t convert_sample_logic_u8(struct dev_context *devc,
 }
 
 static size_t convert_sample_logic_u16(struct dev_context *devc,
-	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
+	uint8_t *dest, const uint8_t *src, size_t srccnt)
 {
 	size_t ret = 0;
 	int ch, bit;
@@ -398,7 +398,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
 			cur_sample_count = devc->convert_sample(devc, devc->convbuffer,
-				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
+				transfer->buffer, transfer->actual_length);
 
 			if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
 				cur_sample_count = devc->limit_samples - devc->sent_samples;
