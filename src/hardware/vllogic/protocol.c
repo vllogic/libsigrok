@@ -162,6 +162,7 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 
 	usb_source_remove(sdi->session, devc->ctx);
 
+	g_free(devc->transferbuffer);
 	g_free(devc->convbuffer);
 }
 
@@ -349,6 +350,63 @@ static size_t convert_sample_data(struct dev_context *devc,
 }
 #endif
 
+
+static void *convert_thread_do(void *p)
+{
+	int sample_count;
+	const struct sr_dev_inst *sdi = p;
+	struct dev_context *devc = sdi->priv;
+
+	while (!devc->acq_aborted) {
+		pthread_cond_wait(&devc->convert_cond, &devc->convert_mutex);
+
+		sample_count = devc->convert_sample(devc, devc->convbuffer,
+			devc->transferbuffer, devc->actual_length);
+
+		if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
+			sample_count = devc->limit_samples - devc->sent_samples;
+
+		pthread_mutex_lock(&devc->out_mutex);
+		devc->out_length = (devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32) ?
+			sample_count * 2 : sample_count;
+		memcpy(devc->outbuffer, devc->convbuffer, devc->out_length);
+		pthread_cond_signal(&devc->out_cond);
+		pthread_mutex_unlock(&devc->out_mutex);
+
+		pthread_mutex_unlock(&devc->convert_mutex);
+	}
+
+	pthread_mutex_destroy(&devc->convert_mutex);
+	pthread_exit(NULL);
+	return NULL;
+}
+
+static void *out_thread_do(void *p)
+{
+	struct sr_datafeed_packet packet;
+	struct sr_datafeed_logic logic;
+	const struct sr_dev_inst *sdi = p;
+	struct dev_context *devc = sdi->priv;
+
+	while (!devc->acq_aborted) {
+		pthread_cond_wait(&devc->out_cond, &devc->out_mutex);
+
+		packet.type = SR_DF_LOGIC;
+		packet.payload = &logic;
+		logic.unitsize = devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32 ? 2 : 1;
+		logic.length = devc->out_length;
+		logic.data = devc->outbuffer;
+		sr_session_send(sdi, &packet);
+		devc->sent_samples += cur_sample_count;
+
+		pthread_mutex_unlock(&devc->out_mutex);
+	}
+
+	pthread_mutex_destroy(&devc->out_mutex);
+	pthread_exit(NULL);
+	return NULL;
+}
+
 static void receive_transfer(struct libusb_transfer *transfer)
 {
 	struct sr_dev_inst *sdi;
@@ -397,6 +455,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
+#if 0
 			cur_sample_count = devc->convert_sample(devc, devc->convbuffer,
 				transfer->buffer, transfer->actual_length);
 
@@ -410,6 +469,13 @@ static void receive_transfer(struct libusb_transfer *transfer)
 			logic.data = devc->convbuffer;
 			sr_session_send(sdi, &packet);
 			devc->sent_samples += cur_sample_count;
+#else
+			pthread_mutex_lock(&devc->convert_mutex);
+			devc->actual_length = transfer->actual_length;
+			memcpy(devc->transferbuffer, transfer->buffer, transfer->actual_length);
+			pthread_cond_signal(&devc->convert_cond);
+			pthread_mutex_unlock(&devc->convert_mutex);
+#endif
 		}
 	}
 	else {
@@ -425,6 +491,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	else
 		resubmit_transfer(transfer);
 }
+
 
 SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 {
@@ -491,11 +558,17 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 	sr_spew("logic_unitbits: %d.", devc->lpc43xx_registers.in_pkt_info.logic_unitbits);
 
 	devc->transferbuffer_size = get_buffer_size(devc);
+	if (!(devc->transferbuffer = g_try_malloc(devc->transferbuffer_size))) {
+		sr_err("transferbuffer malloc failed.");
+		return SR_ERR_MALLOC;
+	}
 	devc->convbuffer_size = devc->transferbuffer_size * 16 / devc->lpc43xx_registers.in_pkt_info.logic_unitchs + 2 * 32;
-	if (!(devc->convbuffer = g_try_malloc(devc->convbuffer_size))) {
+	if (!(devc->convbuffer = g_try_malloc(devc->convbuffer_size * 2))) {
+		g_free(devc->transferbuffer);
 		sr_err("Conversion buffer malloc failed.");
 		return SR_ERR_MALLOC;
 	}
+	devc->outbuffer = devc->convbuffer + devc->convbuffer_size;
 
 	timeout = get_timeout(devc);
 	sr_spew("timeout: %d.", timeout);
@@ -527,6 +600,13 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		devc->transfers[i] = transfer;
 		devc->submitted_transfers++;
 	}
+
+	devc->convert_mutex = PTHREAD_MUTEX_INITIALIZER;
+	devc->convert_cond = PTHREAD_COND_INITIALIZER;
+	pthread_create(&devc->convert_thread, NULL, convert_thread_do, sdi);
+	devc->out_mutex = PTHREAD_MUTEX_INITIALIZER;
+	devc->out_cond = PTHREAD_COND_INITIALIZER;
+	pthread_create(&devc->out_thread, NULL, out_thread_do, sdi);
 
 	return SR_OK;
 }

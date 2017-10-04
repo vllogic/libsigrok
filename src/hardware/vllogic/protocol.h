@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <glib.h>
 #include <libsigrok/libsigrok.h>
+#include <pthread.h>
 #include "libsigrok-internal.h"
 
 #define LOG_PREFIX					"vllogic"
@@ -148,8 +149,13 @@ struct dev_context
 	int32_t submitted_transfers;
 	struct libusb_transfer *transfers[BULK_IN_TRANSFERS_NUM];
 	size_t transferbuffer_size;
-	uint8_t *convbuffer;
 	size_t convbuffer_size;
+
+	uint8_t *transferbuffer;
+	size_t actual_length;
+	uint8_t *convbuffer;
+	uint8_t *outbuffer;
+	size_t out_length;
 
 
 	uint16_t digital_channel_masks[16];
@@ -165,6 +171,14 @@ struct dev_context
 	size_t (*convert_sample)(struct dev_context *devc,
 		uint8_t *dest, const uint8_t *src, size_t srccnt);	
 	struct sr_context *ctx;
+
+	pthread_t convert_thread;
+	pthread_mutex_t convert_mutex;
+	pthread_cond_t convert_cond;
+
+	pthread_t out_thread;
+	pthread_mutex_t out_mutex;
+	pthread_cond_t out_cond;
 };
 
 SR_PRIV struct dev_context *vll_new_device(struct drv_context *drvc, struct sr_usb_dev_inst *usb);
