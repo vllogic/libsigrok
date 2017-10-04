@@ -472,6 +472,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 			devc->digital_channel_masks[j++] = 0x1ul << i;
 		}
 	}
+	sr_spew("digital_channel_select_num: %d.", devc->digital_channel_select_num);
 
 	switch (devc->lpc43xx_registers.in_pkt_info.logic_unitbits) {
 	case 32:
@@ -487,6 +488,7 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 			devc->lpc43xx_registers.in_pkt_info.logic_unitbits);
 		return SR_ERR;
 	}
+	sr_spew("logic_unitbits: %d.", devc->lpc43xx_registers.in_pkt_info.logic_unitbits);
 
 	devc->transferbuffer_size = get_buffer_size(devc);
 	devc->convbuffer_size = devc->transferbuffer_size * 16 / devc->lpc43xx_registers.in_pkt_info.logic_unitchs + 2 * 32;
