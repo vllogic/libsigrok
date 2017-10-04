@@ -254,7 +254,7 @@ static size_t convert_sample_logic_u8(struct dev_context *devc,
 	uint32_t ch, byte, bit;
 	uint8_t channel_data[256];
 	uint16_t *ch_masks = devc->digital_channel_masks;
-	uint32_t ch_num = devc->digital_channel_num;
+	uint32_t ch_num = devc->digital_channel_select_num;
 	uint32_t unitbits = devc->lpc43xx_registers.in_pkt_info.logic_unitbits;
 
 	srccnt /= (unitbits / 8) * ch_num;
@@ -284,7 +284,7 @@ static size_t convert_sample_logic_u16(struct dev_context *devc,
 	uint32_t ch, bit;
 	uint16_t channel_data[32];
 	uint16_t *ch_masks = devc->digital_channel_masks;
-	uint32_t ch_num = devc->digital_channel_num;
+	uint32_t ch_num = devc->digital_channel_select_num;
 	const uint32_t *src32 = (const uint32_t *)src;
 
 	srccnt /= 4 * ch_num;
