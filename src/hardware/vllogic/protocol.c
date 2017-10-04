@@ -281,7 +281,7 @@ static size_t convert_sample_logic_u16(struct dev_context *devc,
 	uint8_t *dest, const uint8_t *src, size_t srccnt)
 {
 	size_t ret = 0;
-	int ch, bit;
+	uint32_t ch, bit;
 	uint16_t channel_data[32];
 	uint16_t *ch_masks = devc->digital_channel_masks;
 	uint32_t ch_num = devc->digital_channel_num;
