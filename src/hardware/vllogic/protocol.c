@@ -405,7 +405,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 			packet.type = SR_DF_LOGIC;
 			packet.payload = &logic;
-			logic.unitsize = 2;
+			logic.unitsize = devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32 ? 2 : 1;
 			logic.length = cur_sample_count * logic.unitsize;
 			logic.data = devc->convbuffer;
 			sr_session_send(sdi, &packet);
