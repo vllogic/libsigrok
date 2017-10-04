@@ -357,8 +357,13 @@ static void *convert_thread_do(void *p)
 	const struct sr_dev_inst *sdi = p;
 	struct dev_context *devc = sdi->priv;
 
-	while (!devc->acq_aborted) {
+	while (1) {
 		pthread_cond_wait(&devc->convert_cond, &devc->convert_mutex);
+
+		if (devc->acq_aborted) {
+			pthread_mutex_unlock(&devc->convert_mutex);
+			break;
+		}
 
 		sample_count = devc->convert_sample(devc, devc->convbuffer,
 			devc->transferbuffer, devc->actual_length);
@@ -390,8 +395,13 @@ static void *out_thread_do(void *p)
 	const struct sr_dev_inst *sdi = p;
 	struct dev_context *devc = sdi->priv;
 
-	while (!devc->acq_aborted) {
+	while (1) {
 		pthread_cond_wait(&devc->out_cond, &devc->out_mutex);
+
+		if (devc->acq_aborted) {
+			pthread_mutex_unlock(&devc->out_mutex);
+			break;
+		}
 
 		packet.type = SR_DF_LOGIC;
 		packet.payload = &logic;
@@ -441,7 +451,17 @@ static void receive_transfer(struct libusb_transfer *transfer)
 		devc->empty_transfer_count++;
 		if (devc->empty_transfer_count > (BULK_IN_TRANSFERS_NUM * 2)) {
 			sr_err("receive_transfer: %d", devc->empty_transfer_count);
+
+			pthread_mutex_lock(&devc->convert_mutex);
+
+			pthread_mutex_lock(&devc->out_mutex);
 			abort_acquisition(devc);
+			pthread_cond_signal(&devc->out_cond);
+			pthread_mutex_unlock(&devc->out_mutex);
+
+			pthread_cond_signal(&devc->convert_cond);
+			pthread_mutex_unlock(&devc->convert_mutex);
+
 			free_transfer(transfer);
 		}
 		else {
@@ -489,7 +509,17 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
 		sr_info("devc->sent_samples: %d", (int)devc->sent_samples);
+
+		pthread_mutex_lock(&devc->convert_mutex);
+
+		pthread_mutex_lock(&devc->out_mutex);
 		abort_acquisition(devc);
+		pthread_cond_signal(&devc->out_cond);
+		pthread_mutex_unlock(&devc->out_mutex);
+
+		pthread_cond_signal(&devc->convert_cond);
+		pthread_mutex_unlock(&devc->convert_mutex);
+
 		free_transfer(transfer);
 	}
 	else
