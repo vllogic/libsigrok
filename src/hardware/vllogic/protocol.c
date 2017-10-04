@@ -212,10 +212,16 @@ static size_t get_buffer_size(struct dev_context *devc)
 	// The buffer should be large enough to hold 20ms of data
 	size_t s = bytes_per_ms(devc) * 20;
 
+
 	if (s <= 20 * 1024)
-		return (s + 511) & ~511;
+		s = 20 * 1024;
 	else
-		return (s / (20 * 1024) + 1) * (20 * 1024);
+		s = (s / (20 * 1024) + 1) * (20 * 1024);
+
+	if (s >= 512000)
+		s = 512000;
+
+	return s;
 }
 
 static uint32_t get_timeout(struct dev_context *devc)
@@ -257,22 +263,28 @@ static size_t convert_sample_logic_u8(struct dev_context *devc,
 	uint16_t *ch_masks = devc->digital_channel_masks;
 	uint32_t ch_num = devc->digital_channel_select_num;
 	uint32_t unitbits = devc->lpc43xx_registers.in_pkt_info.logic_unitbits;
+	uint32_t pkt_size = devc->lpc43xx_registers.in_pkt_info.pkt_size;
+	uint32_t data_size = devc->lpc43xx_registers.in_pkt_info.data_size;
 
-	srccnt /= (unitbits / 8) * ch_num;
-	while (srccnt--) {
-		memset(channel_data, 0, unitbits);
-		for (ch = 0; ch < ch_num; ch++) {
-			for (byte = 0; byte < (unitbits / 8); byte++) {
-				uint8_t sample = *src++;
-				for (bit = 0; bit < 8; bit++, sample >>= 1) {
-					if (sample & 0x1)
-						channel_data[byte * 8 + bit] |= ch_masks[ch];
+	while (srccnt >= pkt_size) {
+		uint32_t size = data_size / ((unitbits / 8) * ch_num);
+		while (size--) {
+			memset(channel_data, 0, unitbits);
+			for (ch = 0; ch < ch_num; ch++) {
+				for (byte = 0; byte < (unitbits / 8); byte++) {
+					uint8_t sample = *src++;
+					for (bit = 0; bit < 8; bit++, sample >>= 1) {
+						if (sample & 0x1)
+							channel_data[byte * 8 + bit] |= ch_masks[ch];
+					}
 				}
 			}
+			memcpy(dest, channel_data, unitbits);
+			dest += unitbits;
+			ret += unitbits;
 		}
-		memcpy(dest, channel_data, unitbits);
-		dest += unitbits;
-		ret += unitbits;
+		srccnt -= pkt_size;
+		src += pkt_size - data_size;
 	}
 
 	return ret;
@@ -287,69 +299,30 @@ static size_t convert_sample_logic_u16(struct dev_context *devc,
 	uint16_t *ch_masks = devc->digital_channel_masks;
 	uint32_t ch_num = devc->digital_channel_select_num;
 	const uint32_t *src32 = (const uint32_t *)src;
+	uint32_t pkt_size = devc->lpc43xx_registers.in_pkt_info.pkt_size;
+	uint32_t data_size = devc->lpc43xx_registers.in_pkt_info.data_size;
 
-	srccnt /= 4 * ch_num;
-	while (srccnt--) {
-		memset(channel_data, 0, sizeof(channel_data));
-		for (ch = 0; ch < ch_num; ch++) {
-			uint32_t sample = *src32++;
-			for (bit = 0; bit < 32; bit++, sample >>= 1) {
-				if (sample & 0x1)
-					channel_data[bit] |= ch_masks[ch];
-			}
-		}
-		memcpy(dest, channel_data, sizeof(channel_data));
-		dest += sizeof(channel_data);
-		ret += 32;
-	}
-
-	return ret;
-}
-
-#if 0
-static size_t convert_sample_data(struct dev_context *devc,
-	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
-{
-	uint16_t channel_data[32];
-	uint32_t i, unitsize, unitshift;
-	size_t ret = 0;
-
-	(void)destcnt;
-
-	unitsize = devc->lpc43xx_registers.in_pkt_info.logic_unitbits *
-		devc->lpc43xx_registers.in_pkt_info.logic_unitchs / 8;
-	unitshift = devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8;
-
-	srccnt /= unitsize;
-
-#if 1
-	while (srccnt--) {
-		uint32_t ch, shift;
-
-		for (shift = 0; shift < devc->lpc43xx_registers.in_pkt_info.logic_unitbits / 8; shift += 4) {
-			memset(channel_data, 0, 2 * 32);
-			for (ch = 0; ch < devc->lpc43xx_registers.in_pkt_info.logic_unitchs; ch++) {
-				uint32_t sample = *(uint32_t *)(src + unitshift * ch + shift);
-				uint16_t channel_mask = devc->digital_channel_masks[ch];
-				for (i = 0; i < 32; i++, sample >>= 1) {
+	while (srccnt >= pkt_size) {
+		uint32_t size = data_size / (4 * ch_num);
+		while (size--) {
+			memset(channel_data, 0, sizeof(channel_data));
+			for (ch = 0; ch < ch_num; ch++) {
+				uint32_t sample = *src32++;
+				for (bit = 0; bit < 32; bit++, sample >>= 1) {
 					if (sample & 0x1)
-						channel_data[i] |= channel_mask;
+						channel_data[bit] |= ch_masks[ch];
 				}
 			}
-			memcpy(dest, channel_data, 2 * 32);
-			dest += 2 * 32;
+			memcpy(dest, channel_data, sizeof(channel_data));
+			dest += sizeof(channel_data);
 			ret += 32;
 		}
-		src += unitsize;
+		srccnt -= pkt_size;
+		src += pkt_size - data_size;
 	}
-#else
-	ret = srccnt * devc->lpc43xx_registers.in_pkt_info.logic_unitbits;
-#endif
 
 	return ret;
 }
-#endif
-
 
 static void *convert_thread_do(void *p)
 {
@@ -370,7 +343,6 @@ static void *convert_thread_do(void *p)
 
 		if (devc->limit_samples && devc->sent_samples + sample_count > devc->limit_samples)
 			sample_count = devc->limit_samples - devc->sent_samples;
-		devc->sent_samples += sample_count;
 
 		pthread_mutex_lock(&devc->out_mutex);
 		devc->out_length = (devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32) ?
@@ -409,6 +381,9 @@ static void *out_thread_do(void *p)
 		logic.length = devc->out_length;
 		logic.data = devc->outbuffer;
 		sr_session_send(sdi, &packet);
+
+		devc->sent_samples += (devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32) ?
+			devc->out_length / 2 : devc->out_length;
 
 		pthread_mutex_unlock(&devc->out_mutex);
 	}
@@ -475,31 +450,11 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
-#if 0
-			int cur_sample_count;
-			struct sr_datafeed_packet packet;
-			struct sr_datafeed_logic logic;
-
-			cur_sample_count = devc->convert_sample(devc, devc->convbuffer,
-				transfer->buffer, transfer->actual_length);
-
-			if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
-				cur_sample_count = devc->limit_samples - devc->sent_samples;
-
-			packet.type = SR_DF_LOGIC;
-			packet.payload = &logic;
-			logic.unitsize = devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32 ? 2 : 1;
-			logic.length = cur_sample_count * logic.unitsize;
-			logic.data = devc->convbuffer;
-			sr_session_send(sdi, &packet);
-			devc->sent_samples += cur_sample_count;
-#else
 			pthread_mutex_lock(&devc->convert_mutex);
 			devc->actual_length = transfer->actual_length;
 			memcpy(devc->transferbuffer, transfer->buffer, transfer->actual_length);
 			pthread_cond_signal(&devc->convert_cond);
 			pthread_mutex_unlock(&devc->convert_mutex);
-#endif
 		}
 	}
 	else {
@@ -603,6 +558,9 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		return SR_ERR_MALLOC;
 	}
 	devc->outbuffer = devc->convbuffer + devc->convbuffer_size;
+
+	sr_spew("transferbuffer_size: %d.", (int)devc->transferbuffer_size);
+	sr_spew("convbuffer_size: %d.", (int)devc->convbuffer_size);
 
 	timeout = get_timeout(devc);
 	sr_spew("timeout: %d.", timeout);

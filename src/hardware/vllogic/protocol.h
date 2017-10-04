@@ -40,6 +40,7 @@
 struct vllogic_in_pkt_info_t
 {
 	uint32_t pkt_size;
+	uint32_t data_size;
 	uint32_t logic_unitcount;
 	uint32_t logic_unitchs;
 	uint32_t logic_unitbits;
