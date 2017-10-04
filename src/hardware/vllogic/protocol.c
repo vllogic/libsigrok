@@ -287,9 +287,9 @@ static size_t convert_sample_logic_u16(struct dev_context *devc,
 	uint32_t ch_num = devc->digital_channel_num;
 	const uint32_t *src32 = (const uint32_t *)src;
 
-	srccnt /= (sizeof(channel_data) / 8) * ch_num;
+	srccnt /= 4 * ch_num;
 	while (srccnt--) {
-		memset(channel_data, 0, sizeof(channel_data) * 2);
+		memset(channel_data, 0, sizeof(channel_data));
 		for (ch = 0; ch < ch_num; ch++) {
 			uint32_t sample = *src32++;
 			for (bit = 0; bit < 32; bit++, sample >>= 1) {
@@ -297,9 +297,9 @@ static size_t convert_sample_logic_u16(struct dev_context *devc,
 					channel_data[bit] |= ch_masks[ch];
 			}
 		}
-		memcpy(dest, channel_data, sizeof(channel_data) * 2);
-		dest += sizeof(channel_data) * 2;
-		ret += sizeof(channel_data);
+		memcpy(dest, channel_data, sizeof(channel_data));
+		dest += sizeof(channel_data);
+		ret += 32;
 	}
 
 	return ret;
