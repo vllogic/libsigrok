@@ -162,6 +162,8 @@ struct dev_context
 	uint32_t analog_channel_select_num;
 	uint32_t analog_channel_num;
 
+	static size_t(*convert_sample)(struct dev_context *devc,
+		uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt);	
 	struct sr_context *ctx;
 };
 

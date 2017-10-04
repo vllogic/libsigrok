@@ -208,11 +208,13 @@ static size_t bytes_per_ms(struct dev_context *devc)
 
 static size_t get_buffer_size(struct dev_context *devc)
 {
-	// The buffer should be large enough to hold 10ms of data
-	size_t s = bytes_per_ms(devc) * 10;
+	// The buffer should be large enough to hold 20ms of data
+	size_t s = bytes_per_ms(devc) * 20;
 
-	s = 10 * bytes_per_ms(devc);
-	return (s + 511) & ~511;
+	if (s <= 20 * 1024)
+		return (s + 511) & ~511;
+	else
+		return (s / (20 * 1024) + 1) * (20 * 1024);
 }
 
 static uint32_t get_timeout(struct dev_context *devc)
@@ -234,20 +236,76 @@ static int configure_requested_channels(const struct sr_dev_inst *sdi)
 	devc = sdi->priv;
 
 	devc->digital_channel_select_mask = 0;
-	devc->digital_channel_select_num = 0;
 
 	for (l = sdi->channels; l; l = l->next) {
 		ch = (struct sr_channel *)l->data;
 
-		if (ch->enabled == TRUE) {
+		if (ch->enabled == TRUE)
 			devc->digital_channel_select_mask |= 0x1ul << (ch->index);
-			devc->digital_channel_select_num++;
-		}
 	}
 
 	return SR_OK;
 }
 
+static size_t convert_sample_logic_u8(struct dev_context *devc,
+	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
+{
+	size_t ret = 0;
+	int ch, byte, bit;
+	uint8_t channel_data[256];
+	uint16_t *ch_masks = devc->digital_channel_masks;
+	uint32_t ch_num = devc->digital_channel_num;
+	uint32_t unitbits = devc->lpc43xx_registers.in_pkt_info.logic_unitbits;
+
+	srccnt /= (unitbits / 8) * ch_num;
+	while (srccnt--) {
+		memset(channel_data, 0, unitbits);
+		for (ch = 0; ch < ch_num; ch++) {
+			for (byte = 0; byte < (unitbits / 8); byte++) {
+				uint8_t sample = *src++;
+				for (bit = 0; bit < 8; bit++, sample >>= 1) {
+					if (sample & 0x1)
+						channel_data[byte * 8 + bit] |= ch_masks[ch];
+				}
+			}
+		}
+		memcpy(dest, channel_data, unitbits);
+		dest += unitbits;
+		ret += unitbits;
+	}
+
+	return ret;
+}
+
+static size_t convert_sample_logic_u16(struct dev_context *devc,
+	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
+{
+	size_t ret = 0;
+	int ch, bit;
+	uint16_t channel_data[32];
+	uint16_t *ch_masks = devc->digital_channel_masks;
+	uint32_t ch_num = devc->digital_channel_num;
+	const uint32_t *src32 = (const uint32_t *)src;
+
+	srccnt /= (sizeof(channel_data) / 8) * ch_num;
+	while (srccnt--) {
+		memset(channel_data, 0, sizeof(channel_data) * 2);
+		for (ch = 0; ch < ch_num; ch++) {
+			uint32_t sample = *src32++;
+			for (bit = 0; bit < 32; bit++, sample >>= 1) {
+				if (sample & 0x1)
+					channel_data[bit] |= ch_masks[ch];
+			}
+		}
+		memcpy(dest, channel_data, sizeof(channel_data) * 2);
+		dest += sizeof(channel_data) * 2;
+		ret += sizeof(channel_data);
+	}
+
+	return ret;
+}
+
+#if 0
 static size_t convert_sample_data(struct dev_context *devc,
 	uint8_t *dest, size_t destcnt, const uint8_t *src, size_t srccnt)
 {
@@ -289,6 +347,7 @@ static size_t convert_sample_data(struct dev_context *devc,
 
 	return ret;
 }
+#endif
 
 static void receive_transfer(struct libusb_transfer *transfer)
 {
@@ -338,12 +397,8 @@ static void receive_transfer(struct libusb_transfer *transfer)
 
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
-			cur_sample_count = convert_sample_data(devc, devc->convbuffer,
+			cur_sample_count = devc->convert_sample(devc, devc->convbuffer,
 				devc->convbuffer_size, transfer->buffer, transfer->actual_length);
-
-			//sr_info("actual_length: %d", transfer->actual_length);
-			//sr_info("cur_sample_count: %d", cur_sample_count);
-			//sr_info("sent_samples: %d", (int)devc->sent_samples);
 
 			if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
 				cur_sample_count = devc->limit_samples - devc->sent_samples;
@@ -353,9 +408,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 			logic.unitsize = 2;
 			logic.length = cur_sample_count * logic.unitsize;
 			logic.data = devc->convbuffer;
-#if 1
 			sr_session_send(sdi, &packet);
-#endif
 			devc->sent_samples += cur_sample_count;
 		}
 	}
@@ -412,9 +465,27 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 
 	sr_spew("pkt_size: %d.", devc->lpc43xx_registers.in_pkt_info.pkt_size);
 	
+	devc->digital_channel_select_num = 0;
 	for (i = 0, j = 0; i < 16; i++) {
-		if (devc->lpc43xx_registers.channels_in_enable_mask & (0x1ul << i))
+		if (devc->lpc43xx_registers.channels_in_enable_mask & (0x1ul << i)) {
+			devc->digital_channel_select_num++;
 			devc->digital_channel_masks[j++] = 0x1ul << i;
+		}
+	}
+
+	switch (devc->lpc43xx_registers.in_pkt_info.logic_unitbits) {
+	case 32:
+		devc->convert_sample = convert_sample_logic_u16;
+		break;
+	case 64:
+	case 128:
+	case 256:
+		devc->convert_sample = convert_sample_logic_u8;
+		break;
+	default:
+		sr_spew("vll_start_acquisition config failed, logic_unitbits: %d.",
+			devc->lpc43xx_registers.in_pkt_info.logic_unitbits);
+		return SR_ERR;
 	}
 
 	devc->transferbuffer_size = get_buffer_size(devc);
