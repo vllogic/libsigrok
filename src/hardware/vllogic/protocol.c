@@ -363,8 +363,9 @@ static void *convert_thread_do(void *p)
 		sample_count = devc->convert_sample(devc, devc->convbuffer,
 			devc->transferbuffer, devc->actual_length);
 
-		if (devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
+		if (devc->limit_samples && devc->sent_samples + sample_count > devc->limit_samples)
 			sample_count = devc->limit_samples - devc->sent_samples;
+		devc->sent_samples += sample_count;
 
 		pthread_mutex_lock(&devc->out_mutex);
 		devc->out_length = (devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32) ?
@@ -377,6 +378,7 @@ static void *convert_thread_do(void *p)
 	}
 
 	pthread_mutex_destroy(&devc->convert_mutex);
+	pthread_cond_destroy(&devc->convert_cond);
 	pthread_exit(NULL);
 	return NULL;
 }
@@ -397,12 +399,12 @@ static void *out_thread_do(void *p)
 		logic.length = devc->out_length;
 		logic.data = devc->outbuffer;
 		sr_session_send(sdi, &packet);
-		devc->sent_samples += cur_sample_count;
 
 		pthread_mutex_unlock(&devc->out_mutex);
 	}
 
 	pthread_mutex_destroy(&devc->out_mutex);
+	pthread_cond_destroy(&devc->out_cond);
 	pthread_exit(NULL);
 	return NULL;
 }
@@ -412,9 +414,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	gboolean packet_has_error = FALSE;
-	int trigger_offset, cur_sample_count;
-	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	int trigger_offset;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -456,6 +456,10 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	if (devc->trigger_fired) {
 		if (!devc->limit_samples || devc->sent_samples < devc->limit_samples) {
 #if 0
+			int cur_sample_count;
+			struct sr_datafeed_packet packet;
+			struct sr_datafeed_logic logic;
+
 			cur_sample_count = devc->convert_sample(devc, devc->convbuffer,
 				transfer->buffer, transfer->actual_length);
 
@@ -601,12 +605,12 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 		devc->submitted_transfers++;
 	}
 
-	devc->convert_mutex = PTHREAD_MUTEX_INITIALIZER;
-	devc->convert_cond = PTHREAD_COND_INITIALIZER;
-	pthread_create(&devc->convert_thread, NULL, convert_thread_do, sdi);
-	devc->out_mutex = PTHREAD_MUTEX_INITIALIZER;
-	devc->out_cond = PTHREAD_COND_INITIALIZER;
-	pthread_create(&devc->out_thread, NULL, out_thread_do, sdi);
+	pthread_mutex_init(&devc->convert_mutex, NULL);
+	pthread_cond_init(&devc->convert_cond, NULL);
+	pthread_create(&devc->convert_thread, NULL, convert_thread_do, (void *)sdi);
+	pthread_mutex_init(&devc->out_mutex, NULL);
+	pthread_cond_init(&devc->out_cond, NULL);
+	pthread_create(&devc->out_thread, NULL, out_thread_do, (void *)sdi);
 
 	return SR_OK;
 }
