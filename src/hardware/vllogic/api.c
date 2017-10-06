@@ -63,10 +63,8 @@ static const uint64_t samplerates[] = {
 	SR_MHZ(50),
 	SR_MHZ(80),
 	SR_MHZ(100),
-	SR_MHZ(120),
 	SR_MHZ(160),
 	SR_MHZ(200),
-	SR_MHZ(240),
 };
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
