@@ -461,7 +461,9 @@ static void receive_transfer(struct libusb_transfer *transfer)
 		}
 	}
 	else {
-		int sample_count, trigger_offset, unit; 
+		int pre_trigger_samples, sample_count, trigger_offset, unit;
+		struct sr_datafeed_packet packet;
+		struct sr_datafeed_logic logic;
 
 		sample_count = devc->convert_sample(devc, devc->convbuffer,
 			transfer->buffer, transfer->actual_length);
