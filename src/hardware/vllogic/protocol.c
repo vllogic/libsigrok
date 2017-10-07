@@ -164,6 +164,10 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 
 	g_free(devc->transferbuffer);
 	g_free(devc->convbuffer);
+	if (devc->stl) {
+		soft_trigger_logic_free(devc->stl);
+		devc->stl = NULL;
+	}
 }
 
 static void free_transfer(struct libusb_transfer *transfer)
@@ -399,7 +403,6 @@ static void receive_transfer(struct libusb_transfer *transfer)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	gboolean packet_has_error = FALSE;
-	int trigger_offset;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -458,8 +461,27 @@ static void receive_transfer(struct libusb_transfer *transfer)
 		}
 	}
 	else {
-		(void)trigger_offset;
-		// TODO
+		int sample_count, trigger_offset, unit; 
+
+		sample_count = devc->convert_sample(devc, devc->convbuffer,
+			transfer->buffer, transfer->actual_length);
+		unit = (devc->lpc43xx_registers.in_pkt_info.logic_unitbits == 32) ? 2 : 1;
+		trigger_offset = soft_trigger_logic_check(devc->stl,
+				devc->convbuffer, sample_count * unit, &pre_trigger_samples);
+		if (trigger_offset > -1) {
+			devc->sent_samples += pre_trigger_samples;
+			packet.type = SR_DF_LOGIC;
+			packet.payload = &logic;
+			sample_count -= trigger_offset;
+			if (devc->limit_samples && devc->sent_samples + sample_count > devc->limit_samples)
+				sample_count = devc->limit_samples - devc->sent_samples;
+			logic.length = sample_count * unit;
+			logic.unitsize = unit;
+			logic.data = devc->convbuffer + trigger_offset * unit;
+			sr_session_send(sdi, &packet);
+			devc->sent_samples += sample_count;
+			devc->trigger_fired = TRUE;
+		}
 	}
 
 	if (devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
@@ -485,6 +507,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
 SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 {
 	struct sr_usb_dev_inst *usb;
+	struct sr_trigger *trigger;
 	struct dev_context *devc;
 	struct libusb_transfer *transfer;
 	uint32_t i, j, status, timeout;
@@ -494,6 +517,18 @@ SR_PRIV int vll_config_acquisition(const struct sr_dev_inst *sdi)
 	usb = sdi->conn;
 
 	configure_requested_channels(sdi);
+
+	if ((trigger = sr_session_trigger_get(sdi->session))) {
+		int pre_trigger_samples = 0;
+		if (devc->limit_samples > 0)
+			pre_trigger_samples = (devc->capture_ratio * devc->limit_samples) / 100;
+		devc->stl = soft_trigger_logic_new(sdi, trigger, pre_trigger_samples);
+		if (!devc->stl)
+			return SR_ERR_MALLOC;
+		devc->trigger_fired = FALSE;
+	}
+	else
+		devc->trigger_fired = TRUE;
 
 	// Configure Vllogic paramter
 	devc->lpc43xx_registers.command = VLLOGIC_CMD_CONFIG;
@@ -631,7 +666,6 @@ SR_PRIV int vll_start_acquisition(const struct sr_dev_inst *sdi)
 	devc->sent_samples = 0;
 	devc->empty_transfer_count = 0;
 	devc->acq_aborted = FALSE;
-	devc->trigger_fired = TRUE;
 
 	if ((ret = vll_config_acquisition(sdi)) < 0)
 		return ret;

@@ -36,6 +36,8 @@ static const uint32_t devopts[] = {
 	SR_CONF_CONTINUOUS,
 	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
+	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 	//SR_CONF_OSCILLOSCOPE,
 	//SR_CONF_VOLTAGE_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	//SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
@@ -47,7 +49,7 @@ static const int32_t trigger_matches[] = {
 	SR_TRIGGER_ONE,
 	SR_TRIGGER_RISING,
 	SR_TRIGGER_FALLING,
-	//SR_TRIGGER_EDGE,
+	SR_TRIGGER_EDGE,
 };
 
 static const uint64_t samplerates[] = {
@@ -177,6 +179,9 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_VOLTAGE_THRESHOLD:
 		// TODO
 		break;
+	case SR_CONF_CAPTURE_RATIO:
+		*data = g_variant_new_uint64(devc->capture_ratio);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -206,6 +211,9 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_VOLTAGE_THRESHOLD:
 		// TODO
 		break;
+	case SR_CONF_CAPTURE_RATIO:
+		devc->capture_ratio = g_variant_get_uint64(data);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -229,7 +237,7 @@ static int config_list(uint32_t key, GVariant **data,
 		// TODO
 		break;
 	case SR_CONF_TRIGGER_MATCH:
-		// TODO
+		*data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
 		break;
 	default:
 		return SR_ERR_NA;

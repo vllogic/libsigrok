@@ -138,12 +138,15 @@ struct dev_context
 	struct lpc43xx_registers_list_t lpc43xx_registers;
 
 	//gboolean continuous_mode;
-	gboolean trigger_fired;
 	gboolean acq_aborted;
 
 	int64_t cur_samplerate;
 	int64_t limit_samples;
 	int64_t sent_samples;
+
+	struct soft_trigger_logic *stl;
+	gboolean trigger_fired;
+	uint64_t capture_ratio;
 
 	int empty_transfer_count;
 	
