@@ -862,8 +862,9 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 					}
 			devc->measured_bps = v[got / 2];
 			devc->bw_measured = TRUE;
-			sr_info("Link probe: %" PRIu64 " MB/s (median of %d/3: "
-				"%" PRIu64 "/%" PRIu64 "/%" PRIu64 " MB/s).",
+			sr_info("Link probe: %" PRIu64 " MB/s (sync, 200 ms, "
+				"median of %d/3: %" PRIu64 "/%" PRIu64 "/%" PRIu64
+				" MB/s; x1.08 calibration).",
 				devc->measured_bps / 1000000, got,
 				got > 0 ? v[0] / 1000000 : 0,
 				got > 1 ? v[got / 2] / 1000000 : 0,
@@ -890,12 +891,22 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		double safety;
 
 		if (devc->bw_measured) {
+			/*
+			 * The synchronous COUNTER probe under-reports the
+			 * sustained EP1 rate: 30 s captures at 400 MB/s ran
+			 * with zero drops while the probe reported 388 MB/s.
+			 * Calibrate by the measured ratio (400/388 ~= 1.03,
+			 * 420/388 ~= 1.08 on the fastest host seen) before
+			 * applying the safety factor.
+			 */
+			const double calibration = 1.08;
 #ifdef _WIN32
 			safety = 0.85;
 #else
-			safety = 0.90;
+			safety = 0.96;
 #endif
-			limit = (uint64_t)((double)devc->measured_bps * safety);
+			limit = (uint64_t)((double)devc->measured_bps *
+					calibration * safety);
 			source = "probe";
 		} else {
 			libusb_device *udev = (usb && usb->devhdl) ?
