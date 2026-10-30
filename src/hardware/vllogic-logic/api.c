@@ -864,7 +864,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 			devc->bw_measured = TRUE;
 			sr_info("Link probe: %" PRIu64 " MB/s (sync, 200 ms, "
 				"median of %d/3: %" PRIu64 "/%" PRIu64 "/%" PRIu64
-				" MB/s; x1.08 calibration).",
+				" MB/s; x1.10 calibration).",
 				devc->measured_bps / 1000000, got,
 				got > 0 ? v[0] / 1000000 : 0,
 				got > 1 ? v[got / 2] / 1000000 : 0,
@@ -893,17 +893,22 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		if (devc->bw_measured) {
 			/*
 			 * The synchronous COUNTER probe under-reports the
-			 * sustained EP1 rate: 30 s captures at 400 MB/s ran
-			 * with zero drops while the probe reported 388 MB/s.
-			 * Calibrate by the measured ratio (400/388 ~= 1.03,
-			 * 420/388 ~= 1.08 on the fastest host seen) before
-			 * applying the safety factor.
+			 * sustained EP1 rate.  Measured (10 s each, 3 runs):
+			 *   COUNTER 2ch        : 377.5 / 382.0 / 380.0 MB/s
+			 *   real 8ch @ 400 MHz : 400.4 MB/s (three runs)
+			 *   real 20ch @ 150 MHz: 375.4 MB/s
+			 * i.e. COUNTER is ~5% low; 420 MB/s is the static
+			 * LINK_LIMIT_BPS (401 MiB/s) in la_recv, not a measured
+			 * value.  Calibrate by 1.10 (5% mode gap + 5% headroom)
+			 * and keep a 0.98 safety factor so a 400 MB/s capture is
+			 * admitted even when the probe reads low (378 * 1.10 *
+			 * 0.98 = 407 MB/s).
 			 */
-			const double calibration = 1.08;
+			const double calibration = 1.10;
 #ifdef _WIN32
 			safety = 0.85;
 #else
-			safety = 0.96;
+			safety = 0.98;
 #endif
 			limit = (uint64_t)((double)devc->measured_bps *
 					calibration * safety);
