@@ -753,6 +753,28 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/uni-t-ut32x/protocol.c \
 	src/hardware/uni-t-ut32x/api.c
 endif
+if HW_VLLOGIC_LOGIC
+src_libdrivers_la_SOURCES += \
+	src/hardware/vllogic-logic/protocol.h \
+	src/hardware/vllogic-logic/protocol.c \
+	src/hardware/vllogic-logic/vllogic.h \
+	src/hardware/vllogic-logic/uhsif_rx.h \
+	src/hardware/vllogic-logic/uhsif_rx.c \
+	src/hardware/vllogic-logic/vllogic_usb.c \
+	src/hardware/vllogic-logic/api.c
+
+noinst_PROGRAMS = vllogic-selftest
+vllogic_selftest_SOURCES = \
+	src/hardware/vllogic-logic/selftest.c \
+	src/hardware/vllogic-logic/protocol.h \
+	src/hardware/vllogic-logic/uhsif_rx.h
+vllogic_selftest_LDADD = $(SR_EXTRA_LIBS)
+# selftest.c #includes these .c files; make the dependency explicit so a
+# change to the parser recompiles the test binary.
+vllogic-selftest$(EXEEXT): $(srcdir)/src/hardware/vllogic-logic/protocol.c \
+		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.c \
+		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.h
+endif
 if HW_YOKOGAWA_DLM
 src_libdrivers_la_SOURCES += \
 	src/hardware/yokogawa-dlm/protocol.h \

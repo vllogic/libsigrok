@@ -345,6 +345,10 @@ ATTRS{idVendor}=="04fc", ATTRS{idProduct}=="0201", ENV{ID_SIGROK}="1"
 # Victor 86C
 ATTRS{idVendor}=="1244", ATTRS{idProduct}=="d237", ENV{ID_SIGROK}="1"
 
+# VLLogic Logic20 (vllogic-logic driver; UHSIF v2.2, bcdDevice 0x0820,
+# product string "Logic20")
+ATTRS{idVendor}=="1209", ATTRS{idProduct}=="6688", ATTRS{bcdDevice}=="0820", ENV{ID_SIGROK}="1"
+
 # Voltcraft DSO2020, renumerates as 1d50:608e "sigrok fx2lafw", Serial: Hantek 6022BE
 ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="2020", ENV{ID_SIGROK}="1"
 
