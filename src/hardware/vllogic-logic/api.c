@@ -876,10 +876,13 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 	/*
-	 * Bandwidth admission: required = rate * nchan / 8.  The usable
-	 * rate is the probed value times a safety factor (0.90 on Linux,
-	 * 0.85 on Windows where libusb scheduling is looser).  Strict mode
-	 * refuses the configuration; permissive mode only warns.
+	 * Bandwidth admission: required = rate * nchan / 8.  The COUNTER
+	 * probe under-reports the sustained EP1 rate by ~4% (it bypasses
+	 * SerDes/bulk_buffer), so the measured value is scaled by 1.10 and
+	 * then by the platform safety factor (0.98 on Linux, 0.85 on
+	 * Windows).  The result is capped at the 400 MB/s sustained ceiling
+	 * measured with 8ch@400MHz / 16ch@200MHz.  Strict mode refuses the
+	 * configuration; permissive mode only warns.
 	 */
 	{
 		struct sr_usb_dev_inst *usb = sdi->conn;
