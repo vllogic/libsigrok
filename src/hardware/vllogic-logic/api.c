@@ -893,18 +893,33 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		if (devc->bw_measured) {
 			/*
 			 * The synchronous COUNTER probe under-reports the
-			 * sustained EP1 rate.  Measured (10 s each, 3 runs):
-			 *   COUNTER 2ch        : 377.5 / 382.0 / 380.0 MB/s
-			 *   real 8ch @ 400 MHz : 400.4 MB/s (three runs)
-			 *   real 20ch @ 150 MHz: 375.4 MB/s
-			 * i.e. COUNTER is ~5% low; 420 MB/s is the static
-			 * LINK_LIMIT_BPS (401 MiB/s) in la_recv, not a measured
-			 * value.  Calibrate by 1.10 (5% mode gap + 5% headroom)
-			 * and keep a 0.98 safety factor so a 400 MB/s capture is
-			 * admitted even when the probe reads low (378 * 1.10 *
-			 * 0.98 = 407 MB/s).
+			 * sustained EP1 rate.  Measured over 10 s (3 runs):
+			 *
+			 *   normal  8ch@400MHz : 400.4 MB/s   (peak observed)
+			 *   normal 16ch@200MHz : 400.4 MB/s
+			 *   normal 20ch@150MHz : 375.4 MB/s
+			 *   normal 20ch@100MHz : 250.4 MB/s
+			 *   counter 2ch@1200MHz: 384.9 MB/s
+			 *   wave                 0 MB/s without a trigger edge
+			 *
+			 * Only COUNTER runs without input or a trigger edge, so it
+			 * is the only mode usable for a start-up probe.  It is
+			 * ~3.9% low because mode 0x06 bypasses the SerDes and
+			 * bulk_buffer path and inserts ~2.2 us per 4092-word
+			 * block; the real capture path reaches 400.4 MB/s.
+			 *
+			 * "420 MB/s" is NOT a measurement: it is la_recv's static
+			 * LINK_LIMIT_BPS (401 MiB/s = 420.48 MB/s).  The highest
+			 * sustained rate ever observed here is 400.4 MB/s, and
+			 * 60 s / 30 s captures at 375 / 400 MB/s ran with zero
+			 * drops, so the admitted ceiling is capped at 400 MB/s.
+			 *
+			 * calibration 1.10 covers the mode gap plus headroom;
+			 * 0.98 safety keeps 400 MB/s admitted even when the probe
+			 * reads low (378 * 1.10 * 0.98 = 407).
 			 */
 			const double calibration = 1.10;
+			const double link_ceiling = 400.0 * 1000 * 1000;
 #ifdef _WIN32
 			safety = 0.85;
 #else
@@ -912,6 +927,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 #endif
 			limit = (uint64_t)((double)devc->measured_bps *
 					calibration * safety);
+			if ((double)limit > link_ceiling)
+				limit = (uint64_t)link_ceiling;
 			source = "probe";
 		} else {
 			libusb_device *udev = (usb && usb->devhdl) ?
