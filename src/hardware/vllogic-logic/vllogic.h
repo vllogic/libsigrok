@@ -87,6 +87,9 @@ struct dev_context {
 	int64_t stop_deadline_us;
 	int64_t start_us;
 	uint64_t last_drop_events;
+	uint64_t measured_bps;		/**< link probe result, valid if bw_measured */
+	gboolean bw_measured;
+	gboolean strict;		/**< VLLOGIC_STRICT != 0 (default 1) */
 };
 
 /* -- vllogic_usb.c -------------------------------------------------------- */
@@ -106,6 +109,8 @@ void vllogic_rx_get_stats(struct vllogic_rx *rx, struct uhsif_stats *stats,
 int vllogic_rx_fatal(struct vllogic_rx *rx);
 uint64_t vllogic_rx_samples_produced(const struct vllogic_rx *rx);
 uint64_t vllogic_rx_drop_events(const struct vllogic_rx *rx);
+int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
+		uint64_t *bps);
 uint64_t vllogic_rx_blocks(const struct vllogic_rx *rx);
 int vllogic_rx_first_block_bad(const struct vllogic_rx *rx, char *buf,
 		size_t buflen);

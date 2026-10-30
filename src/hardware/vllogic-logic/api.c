@@ -341,6 +341,16 @@ static int dev_open(struct sr_dev_inst *sdi)
 
 	devc->usb_ctx = drvc->sr_ctx->libusb_ctx;
 
+	/* Probe is per session: forget any value from a previous run. */
+	devc->measured_bps = 0;
+	devc->bw_measured = FALSE;
+	{
+		const char *e = getenv("VLLOGIC_STRICT");
+
+		/* Unset or "1" is strict; only an explicit "0" is permissive. */
+		devc->strict = !(e && e[0] == '0' && e[1] == '\0');
+	}
+
 	return SR_OK;
 }
 
@@ -814,44 +824,6 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		}
 	}
 
-	/*
-	 * Link bandwidth cap: the FPGA will silently drop snapshots once the
-	 * wire rate exceeds what the USB link can carry.  Reject the
-	 * configuration instead of recording a corrupt capture.
-	 */
-	{
-		struct sr_usb_dev_inst *usb = sdi->conn;
-		uint64_t bytes_per_s = devc->samplerate *
-				(uint64_t)nlogical / 8u;
-		uint64_t limit = 5ull * 1000 * 1000;	/* unknown / full speed */
-		const char *speed_name = "unknown";
-		libusb_device *udev = (usb && usb->devhdl) ?
-				libusb_get_device(usb->devhdl) : NULL;
-		int speed = udev ? libusb_get_device_speed(udev) : -1;
-
-		switch (speed) {
-		case LIBUSB_SPEED_SUPER:
-		case LIBUSB_SPEED_SUPER_PLUS:
-			limit = 350ull * 1000 * 1000;
-			speed_name = "SuperSpeed";
-			break;
-		case LIBUSB_SPEED_HIGH:
-			limit = 35ull * 1000 * 1000;
-			speed_name = "HighSpeed";
-			break;
-		default:
-			break;
-		}
-		if (bytes_per_s > limit) {
-			sr_err("Capture needs %" PRIu64 " MB/s (%" PRIu64
-				" Hz x %d ch) but the %s link caps at %" PRIu64
-				" MB/s; reduce the samplerate or the channel "
-				"count.", bytes_per_s / 1000000, devc->samplerate,
-				nlogical, speed_name, limit / 1000000);
-			return SR_ERR_ARG;
-		}
-	}
-
 	if (vllogic_map_build(logical, nlogical, &devc->map) != 0) {
 		sr_err("Invalid channel selection.");
 		return SR_ERR;
@@ -862,6 +834,116 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	if (!devc->rx) {
 		sr_err("Failed to allocate the receive pipeline.");
 		return SR_ERR;
+	}
+
+	/*
+	 * Link probe: once per session, before the event thread starts, so
+	 * EP1 is owned exclusively.  Three 200 ms counter-mode bursts; take
+	 * the median to reject a single noisy sample.
+	 */
+	if (!devc->bw_measured) {
+		uint64_t v[3];
+		int got = 0, i, j;
+
+		for (i = 0; i < 3; i++) {
+			uint64_t bps = 0;
+
+			if (vllogic_probe_link(devc->rx, 200, &bps) == SR_OK &&
+			    bps > 0)
+				v[got++] = bps;
+		}
+		if (got > 0) {
+			for (i = 0; i < got; i++)
+				for (j = i + 1; j < got; j++)
+					if (v[j] < v[i]) {
+						uint64_t t = v[i];
+						v[i] = v[j];
+						v[j] = t;
+					}
+			devc->measured_bps = v[got / 2];
+			devc->bw_measured = TRUE;
+			sr_info("Link probe: %" PRIu64 " MB/s (median of %d/3: "
+				"%" PRIu64 "/%" PRIu64 "/%" PRIu64 " MB/s).",
+				devc->measured_bps / 1000000, got,
+				got > 0 ? v[0] / 1000000 : 0,
+				got > 1 ? v[got / 2] / 1000000 : 0,
+				got > 0 ? v[got - 1] / 1000000 : 0);
+		} else {
+			sr_warn("Link probe failed; using the static cap "
+				"(350/35/5 MB/s by link speed).");
+		}
+	}
+
+	/*
+	 * Bandwidth admission: required = rate * nchan / 8.  The usable
+	 * rate is the probed value times a safety factor (0.90 on Linux,
+	 * 0.85 on Windows where libusb scheduling is looser).  Strict mode
+	 * refuses the configuration; permissive mode only warns.
+	 */
+	{
+		struct sr_usb_dev_inst *usb = sdi->conn;
+		uint64_t required = devc->samplerate *
+				(uint64_t)nlogical / 8u;
+		uint64_t limit;
+		const char *source;
+		const char *env;
+		double safety;
+
+		if (devc->bw_measured) {
+#ifdef _WIN32
+			safety = 0.85;
+#else
+			safety = 0.90;
+#endif
+			limit = (uint64_t)((double)devc->measured_bps * safety);
+			source = "probe";
+		} else {
+			libusb_device *udev = (usb && usb->devhdl) ?
+					libusb_get_device(usb->devhdl) : NULL;
+			int speed = udev ? libusb_get_device_speed(udev) : -1;
+
+			limit = 5ull * 1000 * 1000;
+			if (speed == LIBUSB_SPEED_SUPER ||
+			    speed == LIBUSB_SPEED_SUPER_PLUS)
+				limit = 350ull * 1000 * 1000;
+			else if (speed == LIBUSB_SPEED_HIGH)
+				limit = 35ull * 1000 * 1000;
+			source = "static";
+		}
+
+		env = getenv("VLLOGIC_MAX_MBPS");
+		if (env && *env) {
+			uint64_t override = strtoull(env, NULL, 10) *
+					1000000ull;
+
+			if (override > 0) {
+				sr_warn("VLLOGIC_MAX_MBPS=%" PRIu64 " overrides "
+					"the %s limit (%" PRIu64 " MB/s).",
+					override / 1000000, source,
+					limit / 1000000);
+				limit = override;
+				source = "env";
+			}
+		}
+
+		if (required > limit) {
+			char msg[256];
+
+			g_snprintf(msg, sizeof(msg),
+				"Capture needs %" PRIu64 " MB/s (%" PRIu64
+				" Hz x %d ch) but the %s limit is %" PRIu64
+				" MB/s (measured %" PRIu64 " MB/s); reduce the "
+				"samplerate or the channel count.",
+				required / 1000000, devc->samplerate, nlogical,
+				source, limit / 1000000,
+				devc->measured_bps / 1000000);
+			if (devc->strict) {
+				sr_err("%s", msg);
+				goto err_free;
+			}
+			sr_warn("%s (VLLOGIC_STRICT=0: starting anyway, "
+				"samples may be dropped).", msg);
+		}
 	}
 
 	if (vllogic_config_device(devc->rx, devc) != SR_OK) {

@@ -1087,6 +1087,98 @@ static int sync_send_cmd(struct vllogic_rx *rx, uint32_t cmd, uint32_t param)
  * followed by the >= 25 ms PWM settling time.  The IN URBs are submitted and
  * START is sent afterwards by the caller, see la_recv.c:1220-1251.
  */
+/**
+ * Measure the usable IN bandwidth with a self-contained counter-mode burst.
+ *
+ * Must be called before vllogic_rx_start(): the event thread is not running
+ * yet, so this owns EP1 exclusively (a second reader would race in_cb()).
+ * The capture path must not see counter-mode blocks, so the probe only uses
+ * the synchronous bulk path and always restores MODE_NORMAL and drains.
+ *
+ * @param window_ms  sampling window, default 200 ms (see api.c)
+ * @param bps        measured bytes/second (not MB/s)
+ * @return SR_OK on success, SR_ERR if any command or the read loop failed
+ */
+int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
+		uint64_t *bps)
+{
+	uint8_t *buf;
+	struct timespec t0, t1;
+	uint64_t bytes = 0;
+	int64_t deadline_us;
+	int ret = SR_ERR;
+	gboolean started = FALSE;
+
+	if (!rx || !bps || window_ms == 0)
+		return SR_ERR;
+
+	buf = g_malloc(256 * 1024);	/* Windows synchronous read cap */
+
+	sync_drain(rx, 32, 5);
+	if (sync_send_cmd(rx, UHSIF_CMD_STOP, 0) != SR_OK)
+		goto out;
+	if (sync_send_cmd(rx, UHSIF_CMD_FLUSH, 0) != SR_OK)
+		goto out;
+	if (sync_send_cmd(rx, UHSIF_CMD_MAX_PAYLOAD,
+			  UHSIF_DEFAULT_PAYLOAD) != SR_OK)
+		goto out;
+	if (sync_send_cmd(rx, UHSIF_CMD_CHANNEL_MASK, 0x3) != SR_OK)
+		goto out;
+	if (sync_send_cmd(rx, UHSIF_CMD_ISERDES_DIV, 2) != SR_OK)
+		goto out;
+	if (sync_send_cmd(rx, UHSIF_CMD_MODE_COUNTER, 0) != SR_OK)
+		goto out;
+
+	if (cmd_write(rx, UHSIF_CMD_START, 0) != SR_OK)
+		goto out;
+	started = TRUE;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	deadline_us = (int64_t)window_ms * 1000;
+
+	for (;;) {
+		int transferred = 0;
+		int r;
+		int64_t elapsed_us;
+
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		elapsed_us = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
+				(t1.tv_nsec - t0.tv_nsec) / 1000;
+		if (elapsed_us >= deadline_us)
+			break;
+
+		r = libusb_bulk_transfer(rx->hdl, VLLOGIC_EP_IN, buf,
+				256 * 1024, &transferred, 50);
+		if (r == LIBUSB_ERROR_TIMEOUT)
+			continue;
+		if (r < 0)
+			break;
+		if (transferred > 0)
+			bytes += (uint64_t)transferred;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	{
+		int64_t elapsed_us = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
+				(t1.tv_nsec - t0.tv_nsec) / 1000;
+
+		if (bytes > 0 && elapsed_us > 0) {
+			*bps = bytes * 1000000ull / (uint64_t)elapsed_us;
+			ret = SR_OK;
+		}
+	}
+
+out:
+	if (started) {
+		(void)sync_send_cmd(rx, UHSIF_CMD_STOP, 0);
+		(void)sync_send_cmd(rx, UHSIF_CMD_MODE_NORMAL, 0);
+	}
+	sync_drain(rx, 32, 5);
+	g_free(buf);
+
+	return ret;
+}
+
 int vllogic_config_device(struct vllogic_rx *rx, const struct dev_context *devc)
 {
 	uint32_t lut[5];
