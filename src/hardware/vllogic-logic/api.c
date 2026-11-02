@@ -433,7 +433,7 @@ static void conf_set_channels(struct sr_dev_inst *sdi, const gboolean *want)
 }
 
 /* Rough admission check: full precision happens at start-up. */
-/* Static link ceiling: 350 MB/s on SuperSpeed, 35 on HighSpeed, 5 else. */
+/* Static link ceiling: 400 MB/s on SuperSpeed, 35 on HighSpeed, 5 else. */
 static uint64_t conf_link_limit(const struct sr_dev_inst *sdi)
 {
 	struct sr_usb_dev_inst *usb = sdi->conn;
@@ -444,7 +444,7 @@ static uint64_t conf_link_limit(const struct sr_dev_inst *sdi)
 	const char *env = getenv("VLLOGIC_MAX_MBPS");
 
 	if (speed == LIBUSB_SPEED_SUPER || speed == LIBUSB_SPEED_SUPER_PLUS)
-		limit = 350ull * 1000 * 1000;
+		limit = 400ull * 1000 * 1000;
 	else if (speed == LIBUSB_SPEED_HIGH)
 		limit = 35ull * 1000 * 1000;
 
@@ -1342,7 +1342,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 				got > 0 ? v[got - 1] / 1000000 : 0);
 		} else {
 			sr_warn("Link probe failed; using the static cap "
-				"(350/35/5 MB/s by link speed).");
+				"(400/35/5 MB/s by link speed).");
 		}
 	}
 
@@ -1412,7 +1412,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 			limit = 5ull * 1000 * 1000;
 			if (speed == LIBUSB_SPEED_SUPER ||
 			    speed == LIBUSB_SPEED_SUPER_PLUS)
-				limit = 350ull * 1000 * 1000;
+				limit = 400ull * 1000 * 1000;
 			else if (speed == LIBUSB_SPEED_HIGH)
 				limit = 35ull * 1000 * 1000;
 			source = "static";
