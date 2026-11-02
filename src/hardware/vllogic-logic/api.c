@@ -359,6 +359,21 @@ static char *conf_path(void)
 	return path;
 }
 
+static gboolean conf_apply_rate(struct dev_context *devc, uint64_t rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < VLLOGIC_NUM_RATES; i++)
+		if (vllogic_rates[i].rate == rate) {
+			devc->div = vllogic_rates[i].div;
+			devc->decimate = vllogic_rates[i].decimate;
+			devc->samplerate = rate;
+			return TRUE;
+		}
+
+	return FALSE;
+}
+
 /* Quantise to the 0.05 V grid used by config_list()/config_set(). */
 static double conf_quantise_threshold(double vth)
 {
@@ -417,32 +432,6 @@ static void conf_set_channels(struct sr_dev_inst *sdi, const gboolean *want)
 	}
 }
 
-/* Reset devc + channels to the documented defaults. */
-static void conf_apply_defaults(struct sr_dev_inst *sdi)
-{
-	struct dev_context *devc = sdi->priv;
-	gboolean all[VLLOGIC_NUM_CHANNELS];
-	int i;
-
-	devc->samplerate = VLLOGIC_CONF_DEFAULT_RATE;
-	for (i = 0; i < (int)VLLOGIC_NUM_RATES; i++)
-		if (vllogic_rates[i].rate == VLLOGIC_CONF_DEFAULT_RATE) {
-			devc->div = vllogic_rates[i].div;
-			devc->decimate = vllogic_rates[i].decimate;
-			break;
-		}
-	devc->limit_samples = 0;
-	devc->cur_threshold = -2.5 + 83 * 0.05;
-	if (vllogic_vth_to_pwm(devc->cur_threshold, &devc->pwm0,
-			       &devc->pwm1) != 0) {
-		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
-		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
-	}
-	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
-		all[i] = TRUE;
-	conf_set_channels(sdi, all);
-}
-
 /* Rough admission check: full precision happens at start-up. */
 static gboolean conf_bandwidth_ok(const struct sr_dev_inst *sdi,
 		uint64_t rate, int nchan)
@@ -488,7 +477,7 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	int i, nchan = 0;
 	double vth;
 	uint64_t rate;
-	gboolean ok = TRUE;
+	gboolean fellback = FALSE;
 
 	if (conf_disabled())
 		return;
@@ -502,6 +491,7 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 
 	kf = g_key_file_new();
 	if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &err)) {
+		/* Cannot attribute anything: whole-group fallback. */
 		sr_warn("config: cannot parse %s (%s); using defaults.",
 			path, err ? err->message : "unknown");
 		g_clear_error(&err);
@@ -514,24 +504,18 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
 		want[i] = TRUE;
 
-	/* samplerate */
+	/* samplerate (per-key fallback) */
 	rate = g_key_file_get_uint64(kf, group, "samplerate", NULL);
 	if (rate == 0 || !conf_rate_valid(rate)) {
-		sr_warn("config: samplerate %" G_GUINT64_FORMAT " is not a "
-			"supported rate; falling back to %" G_GUINT64_FORMAT
-			" Hz.", rate, (uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
+		sr_warn("config: samplerate %" G_GUINT64_FORMAT " is not "
+			"supported; using %" G_GUINT64_FORMAT " Hz.",
+			rate, (uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
 		rate = VLLOGIC_CONF_DEFAULT_RATE;
-		ok = FALSE;
+		fellback = TRUE;
 	}
-	for (i = 0; i < (int)VLLOGIC_NUM_RATES; i++)
-		if (vllogic_rates[i].rate == rate) {
-			devc->div = vllogic_rates[i].div;
-			devc->decimate = vllogic_rates[i].decimate;
-			break;
-		}
-	devc->samplerate = rate;
+	(void)conf_apply_rate(devc, rate);
 
-	/* channels */
+	/* channels (per-key fallback) */
 	chans = g_key_file_get_string(kf, group, "channels", NULL);
 	if (chans && *chans) {
 		gchar **parts = g_strsplit(chans, ",", -1);
@@ -560,56 +544,68 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 			for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
 				want[i] = TRUE;
 			nchan = VLLOGIC_NUM_CHANNELS;
-			ok = FALSE;
+			fellback = TRUE;
 		}
 	} else {
 		nchan = VLLOGIC_NUM_CHANNELS;
 	}
 
-	/* limit_samples */
+	/* limit_samples: uint64, no invalid values */
 	devc->limit_samples = g_key_file_get_uint64(kf, group,
 			"limit_samples", NULL);
 
-	/* threshold */
+	/* threshold (per-key fallback) */
 	vth = g_key_file_get_double(kf, group, "threshold", NULL);
 	if (!isfinite(vth) || vth < -2.5 || vth > 5.0) {
 		sr_warn("config: threshold %.3f V out of range; using 1.65 V.",
 			vth);
 		vth = -2.5 + 83 * 0.05;
-		ok = FALSE;
+		fellback = TRUE;
 	}
 	devc->cur_threshold = conf_quantise_threshold(vth);
 	if (vllogic_vth_to_pwm(devc->cur_threshold, &devc->pwm0,
 			       &devc->pwm1) != 0) {
 		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
 		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
-		ok = FALSE;
+		fellback = TRUE;
 	}
 
-	/* bandwidth + per-rate channel cap */
-	if (nchan > vllogic_max_channels(rate)) {
-		sr_warn("config: %d channels exceed the %d allowed at "
-			"%" G_GUINT64_FORMAT " Hz; using defaults.",
-			nchan, vllogic_max_channels(rate), rate);
-		ok = FALSE;
-	} else if (!conf_bandwidth_ok(sdi, rate, nchan)) {
+	/*
+	 * Bandwidth / per-rate channel cap: keep threshold, limit and the
+	 * channel set; only the samplerate is lowered.  If even the default
+	 * rate cannot carry the selection, widen the channels as a last
+	 * resort.
+	 */
+	if (nchan > vllogic_max_channels(rate) ||
+	    !conf_bandwidth_ok(sdi, rate, nchan)) {
 		sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch exceeds the "
-			"static link cap; using defaults.", rate, nchan);
-		ok = FALSE;
-	}
+			"link cap; samplerate lowered to %" G_GUINT64_FORMAT
+			" Hz.", rate, nchan,
+			(uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
+		rate = VLLOGIC_CONF_DEFAULT_RATE;
+		(void)conf_apply_rate(devc, rate);
+		fellback = TRUE;
 
-	if (!ok) {
-		sr_warn("config: %s has an unusable combination; using "
-			"defaults.", path);
-		conf_apply_defaults(sdi);
-	} else {
-		conf_set_channels(sdi, want);
-		sr_info("config: loaded %s (threshold=%.2f, samplerate=%"
-			G_GUINT64_FORMAT ", limit=%" G_GUINT64_FORMAT
-			", channels=%s).", path, devc->cur_threshold,
-			devc->samplerate, devc->limit_samples,
-			chans ? chans : "0-19");
+		if (nchan > vllogic_max_channels(rate) ||
+		    !conf_bandwidth_ok(sdi, rate, nchan)) {
+			sr_warn("config: even %" G_GUINT64_FORMAT " Hz x %d ch "
+				"does not fit; enabling all %d channels.",
+				rate, nchan, VLLOGIC_NUM_CHANNELS);
+			for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+				want[i] = TRUE;
+			nchan = VLLOGIC_NUM_CHANNELS;
+			fellback = TRUE;
+		}
 	}
+	devc->samplerate = rate;
+
+	conf_set_channels(sdi, want);
+	sr_info("config: loaded %s (threshold=%.2f, samplerate=%"
+		G_GUINT64_FORMAT ", limit=%" G_GUINT64_FORMAT
+		", channels=%s)%s.", path, devc->cur_threshold,
+		devc->samplerate, devc->limit_samples,
+		chans ? chans : "0-19",
+		fellback ? " with fallbacks" : "");
 
 	g_free(chans);
 	g_free(group);
