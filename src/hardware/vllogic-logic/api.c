@@ -277,6 +277,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		devc->limit_samples = 0;
 		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
 		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
+		/* pwm0=19 maps to ~1.6412 V; nearest 0.05 V grid point. */
+		devc->cur_threshold = 1.65;
 		atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
 		devc->usb_ctx = NULL;
 
@@ -472,13 +474,16 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_LIMIT_SAMPLES:
 		*data = g_variant_new_uint64(devc->limit_samples);
 		break;
-	case SR_CONF_VOLTAGE_THRESHOLD: {
-		double vth = vllogic_pwm_to_vth(devc->pwm0, devc->pwm1);
-
-		/* Single-ended threshold: low == high. */
-		*data = std_gvar_tuple_double(vth, vth);
+	case SR_CONF_VOLTAGE_THRESHOLD:
+		/*
+		 * Return the nominal grid value last set, not the PWM-quantised
+		 * voltage.  GUIs (PulseView prop/enum.cpp) locate the current
+		 * entry by exact comparison against the LIST values, so GET and
+		 * LIST must produce bit-identical doubles.
+		 */
+		*data = std_gvar_tuple_double(devc->cur_threshold,
+				devc->cur_threshold);
 		break;
-	}
 	case SR_CONF_CONN:
 		if (!sdi->connection_id)
 			return SR_ERR_ARG;
@@ -555,6 +560,19 @@ static int config_set(uint32_t key, GVariant *data,
 				vth);
 			return SR_ERR_ARG;
 		}
+		/*
+		 * Quantise to the same 0.05 V grid the LIST advertises so the
+		 * value reported by GET is bit-identical to a LIST entry.
+		 */
+		{
+			long idx = lround((vth + 2.5) / 0.05);
+
+			if (idx < 0)
+				idx = 0;
+			if (idx > 150)
+				idx = 150;
+			vth = -2.5 + (double)idx * 0.05;
+		}
 		if (vllogic_vth_to_pwm(vth, &pwm0, &pwm1) != 0) {
 			sr_err("Threshold %.3f V cannot be represented.", vth);
 			return SR_ERR_ARG;
@@ -580,6 +598,7 @@ static int config_set(uint32_t key, GVariant *data,
 
 		devc->pwm0 = pwm0;
 		devc->pwm1 = pwm1;
+		devc->cur_threshold = vth;
 		break;
 	}
 	default:
@@ -597,9 +616,26 @@ static int config_list(uint32_t key, GVariant **data,
 		*data = std_gvar_samplerates(vllogic_samplerates(),
 				VLLOGIC_NUM_RATES);
 		break;
-	case SR_CONF_VOLTAGE_THRESHOLD:
-		*data = std_gvar_min_max_step_thresholds(-2.5, 5.0, 0.1);
+	case SR_CONF_VOLTAGE_THRESHOLD: {
+		/*
+		 * 0.05 V grid, -2.5 .. +5.0 V (151 entries).  Built with the
+		 * same expression as config_set() so GET == LIST exactly;
+		 * std_gvar_min_max_step_thresholds() accumulates d += step and
+		 * would not match bit-for-bit.
+		 */
+		GVariantBuilder *b = g_variant_builder_new(
+				G_VARIANT_TYPE_ARRAY);
+		int i;
+
+		for (i = 0; i <= 150; i++) {
+			double v = -2.5 + (double)i * 0.05;
+
+			g_variant_builder_add(b, "(dd)", v, v);
+		}
+		*data = g_variant_builder_end(b);
+		g_variant_builder_unref(b);
 		break;
+	}
 	default:
 		return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts,
 				devopts);
@@ -1015,9 +1051,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 	sr_info("Acquisition started: %" G_GUINT64_FORMAT " Hz, %d channels, "
-		"unitsize %d, div %u, decimate %u, pwm0 %u, pwm1 %u.",
+		"unitsize %d, div %u, decimate %u, threshold %.2f V, "
+		"pwm0 %u, pwm1 %u.",
 		devc->samplerate, devc->map.nchan, devc->map.unitsize,
-		devc->div, devc->decimate, devc->pwm0, devc->pwm1);
+		devc->div, devc->decimate, devc->cur_threshold,
+		devc->pwm0, devc->pwm1);
 
 	return SR_OK;
 

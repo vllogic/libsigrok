@@ -82,6 +82,7 @@ struct dev_context {
 	uint32_t decimate;		/**< PC decimation, 1/2/4/8/20. */
 	uint8_t pwm0;
 	uint8_t pwm1;
+	double cur_threshold;		/**< nominal threshold from the LIST grid */
 
 	atomic_int state;		/* set from the session thread, polled by dev_close() */
 	int64_t stop_deadline_us;
