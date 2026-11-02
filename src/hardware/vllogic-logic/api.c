@@ -277,8 +277,13 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		devc->limit_samples = 0;
 		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
 		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
-		/* pwm0=19 maps to ~1.6412 V; nearest 0.05 V grid point. */
-		devc->cur_threshold = 1.65;
+		/*
+		 * pwm0=19 maps to ~1.6412 V; nearest 0.05 V grid point is
+		 * index 83.  Use the very same expression as config_list() so
+		 * the default is bit-identical to LIST[83] (a literal 1.65
+		 * differs by 4.4e-16, which is exactly PulseView's tolerance).
+		 */
+		devc->cur_threshold = -2.5 + 83 * 0.05;
 		atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
 		devc->usb_ctx = NULL;
 
