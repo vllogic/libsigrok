@@ -303,6 +303,359 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Configuration persistence                                                 */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Per-device settings live in <user-config-dir>/vllogic-logic/config.ini:
+ *   Linux   ~/.config/vllogic-logic/config.ini
+ *   Windows %APPDATA%\vllogic-logic\config.ini
+ *   macOS   ~/Library/Application Support/vllogic-logic/config.ini
+ * Only GLib APIs are used, so there is no platform-specific code.
+ */
+#define VLLOGIC_CONF_VERSION	1
+#define VLLOGIC_CONF_DEFAULT_RATE	SR_MHZ(20)
+
+static gboolean conf_disabled(void)
+{
+	const char *e = getenv("VLLOGIC_NO_SAVE");
+
+	return e && e[0] == '1' && e[1] == '\0';
+}
+
+/* INI group name: serial number, else connection id, sanitised. */
+static char *conf_group(const struct sr_dev_inst *sdi)
+{
+	const char *src = NULL;
+	char *g, *p;
+
+	if (sdi->serial_num && *sdi->serial_num)
+		src = sdi->serial_num;
+	else if (sdi->connection_id && *sdi->connection_id)
+		src = sdi->connection_id;
+	else
+		src = "default";
+
+	g = g_strdup(src);
+	for (p = g; *p; p++) {
+		if (*p == '[' || *p == ']' || *p == '=' || *p == ';' ||
+		    *p == '#' || *p == '/')
+			*p = '_';
+	}
+
+	return g;
+}
+
+static char *conf_path(void)
+{
+	char *dir = g_build_filename(g_get_user_config_dir(),
+			"vllogic-logic", NULL);
+	char *path;
+
+	g_mkdir_with_parents(dir, 0700);
+	path = g_build_filename(dir, "config.ini", NULL);
+	g_free(dir);
+
+	return path;
+}
+
+/* Quantise to the 0.05 V grid used by config_list()/config_set(). */
+static double conf_quantise_threshold(double vth)
+{
+	long idx = lround((vth + 2.5) / 0.05);
+
+	if (idx < 0)
+		idx = 0;
+	if (idx > 150)
+		idx = 150;
+
+	return -2.5 + (double)idx * 0.05;
+}
+
+static gboolean conf_rate_valid(uint64_t rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < VLLOGIC_NUM_RATES; i++)
+		if (vllogic_rates[i].rate == rate)
+			return TRUE;
+
+	return FALSE;
+}
+
+/* Enabled channel indices as "0,1,2" (all 20 -> empty string is not used). */
+static char *conf_channels_string(const struct sr_dev_inst *sdi)
+{
+	GString *s = g_string_new(NULL);
+	GSList *l;
+
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+
+		if (ch->type != SR_CHANNEL_LOGIC || !ch->enabled)
+			continue;
+		if (s->len)
+			g_string_append_c(s, ',');
+		g_string_append_printf(s, "%d", ch->index);
+	}
+
+	return g_string_free(s, FALSE);
+}
+
+static void conf_set_channels(struct sr_dev_inst *sdi, const gboolean *want)
+{
+	GSList *l;
+
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+
+		if (ch->type != SR_CHANNEL_LOGIC)
+			continue;
+		ch->enabled = (ch->index >= 0 &&
+			       ch->index < VLLOGIC_NUM_CHANNELS) ?
+				want[ch->index] : FALSE;
+	}
+}
+
+/* Reset devc + channels to the documented defaults. */
+static void conf_apply_defaults(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	gboolean all[VLLOGIC_NUM_CHANNELS];
+	int i;
+
+	devc->samplerate = VLLOGIC_CONF_DEFAULT_RATE;
+	for (i = 0; i < (int)VLLOGIC_NUM_RATES; i++)
+		if (vllogic_rates[i].rate == VLLOGIC_CONF_DEFAULT_RATE) {
+			devc->div = vllogic_rates[i].div;
+			devc->decimate = vllogic_rates[i].decimate;
+			break;
+		}
+	devc->limit_samples = 0;
+	devc->cur_threshold = -2.5 + 83 * 0.05;
+	if (vllogic_vth_to_pwm(devc->cur_threshold, &devc->pwm0,
+			       &devc->pwm1) != 0) {
+		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
+		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
+	}
+	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+		all[i] = TRUE;
+	conf_set_channels(sdi, all);
+}
+
+/* Rough admission check: full precision happens at start-up. */
+static gboolean conf_bandwidth_ok(const struct sr_dev_inst *sdi,
+		uint64_t rate, int nchan)
+{
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	libusb_device *udev = (usb && usb->devhdl) ?
+			libusb_get_device(usb->devhdl) : NULL;
+	int speed = udev ? libusb_get_device_speed(udev) : -1;
+	uint64_t required = rate * (uint64_t)nchan / 8u;
+	uint64_t limit = 5ull * 1000 * 1000;
+	const char *env = getenv("VLLOGIC_MAX_MBPS");
+
+	(void)devc;
+	if (speed == LIBUSB_SPEED_SUPER || speed == LIBUSB_SPEED_SUPER_PLUS)
+		limit = 350ull * 1000 * 1000;
+	else if (speed == LIBUSB_SPEED_HIGH)
+		limit = 35ull * 1000 * 1000;
+
+	if (env && *env) {
+		uint64_t o = strtoull(env, NULL, 10) * 1000000ull;
+
+		if (o > 0)
+			limit = o;
+	}
+
+	return required <= limit;
+}
+
+/**
+ * Load <user-config-dir>/vllogic-logic/config.ini for this device.
+ *
+ * Invalid values fall back to defaults one key at a time; a bandwidth
+ * mismatch resets the whole group (the combination is what is invalid).
+ */
+static void vllogic_conf_load(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	GKeyFile *kf;
+	char *path, *group, *chans = NULL;
+	GError *err = NULL;
+	gboolean want[VLLOGIC_NUM_CHANNELS];
+	int i, nchan = 0;
+	double vth;
+	uint64_t rate;
+	gboolean ok = TRUE;
+
+	if (conf_disabled())
+		return;
+
+	path = conf_path();
+	if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+		sr_info("config: using defaults (no %s yet).", path);
+		g_free(path);
+		return;
+	}
+
+	kf = g_key_file_new();
+	if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &err)) {
+		sr_warn("config: cannot parse %s (%s); using defaults.",
+			path, err ? err->message : "unknown");
+		g_clear_error(&err);
+		g_key_file_free(kf);
+		g_free(path);
+		return;
+	}
+
+	group = conf_group(sdi);
+	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+		want[i] = TRUE;
+
+	/* samplerate */
+	rate = g_key_file_get_uint64(kf, group, "samplerate", NULL);
+	if (rate == 0 || !conf_rate_valid(rate)) {
+		sr_warn("config: samplerate %" G_GUINT64_FORMAT " is not a "
+			"supported rate; falling back to %" G_GUINT64_FORMAT
+			" Hz.", rate, (uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
+		rate = VLLOGIC_CONF_DEFAULT_RATE;
+		ok = FALSE;
+	}
+	for (i = 0; i < (int)VLLOGIC_NUM_RATES; i++)
+		if (vllogic_rates[i].rate == rate) {
+			devc->div = vllogic_rates[i].div;
+			devc->decimate = vllogic_rates[i].decimate;
+			break;
+		}
+	devc->samplerate = rate;
+
+	/* channels */
+	chans = g_key_file_get_string(kf, group, "channels", NULL);
+	if (chans && *chans) {
+		gchar **parts = g_strsplit(chans, ",", -1);
+		gboolean any = FALSE;
+
+		for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+			want[i] = FALSE;
+		for (i = 0; parts[i]; i++) {
+			char *end = NULL;
+			long v = strtol(parts[i], &end, 10);
+
+			if (end == parts[i] || *end != '\0' || v < 0 ||
+			    v >= VLLOGIC_NUM_CHANNELS)
+				continue;
+			want[v] = TRUE;
+			any = TRUE;
+		}
+		g_strfreev(parts);
+		if (any) {
+			for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+				nchan += want[i];
+		} else {
+			sr_warn("config: channels '%s' has no valid index; "
+				"enabling all %d.", chans,
+				VLLOGIC_NUM_CHANNELS);
+			for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+				want[i] = TRUE;
+			nchan = VLLOGIC_NUM_CHANNELS;
+			ok = FALSE;
+		}
+	} else {
+		nchan = VLLOGIC_NUM_CHANNELS;
+	}
+
+	/* limit_samples */
+	devc->limit_samples = g_key_file_get_uint64(kf, group,
+			"limit_samples", NULL);
+
+	/* threshold */
+	vth = g_key_file_get_double(kf, group, "threshold", NULL);
+	if (!isfinite(vth) || vth < -2.5 || vth > 5.0) {
+		sr_warn("config: threshold %.3f V out of range; using 1.65 V.",
+			vth);
+		vth = -2.5 + 83 * 0.05;
+		ok = FALSE;
+	}
+	devc->cur_threshold = conf_quantise_threshold(vth);
+	if (vllogic_vth_to_pwm(devc->cur_threshold, &devc->pwm0,
+			       &devc->pwm1) != 0) {
+		devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
+		devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
+		ok = FALSE;
+	}
+
+	/* bandwidth + per-rate channel cap */
+	if (nchan > vllogic_max_channels(rate)) {
+		sr_warn("config: %d channels exceed the %d allowed at "
+			"%" G_GUINT64_FORMAT " Hz; using defaults.",
+			nchan, vllogic_max_channels(rate), rate);
+		ok = FALSE;
+	} else if (!conf_bandwidth_ok(sdi, rate, nchan)) {
+		sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch exceeds the "
+			"static link cap; using defaults.", rate, nchan);
+		ok = FALSE;
+	}
+
+	if (!ok) {
+		sr_warn("config: %s has an unusable combination; using "
+			"defaults.", path);
+		conf_apply_defaults(sdi);
+	} else {
+		conf_set_channels(sdi, want);
+		sr_info("config: loaded %s (threshold=%.2f, samplerate=%"
+			G_GUINT64_FORMAT ", limit=%" G_GUINT64_FORMAT
+			", channels=%s).", path, devc->cur_threshold,
+			devc->samplerate, devc->limit_samples,
+			chans ? chans : "0-19");
+	}
+
+	g_free(chans);
+	g_free(group);
+	g_key_file_free(kf);
+	g_free(path);
+}
+
+static void vllogic_conf_save(struct sr_dev_inst *sdi)
+{
+	GKeyFile *kf;
+	char *path, *group, *chans, *data;
+	gsize len = 0;
+	GError *err = NULL;
+
+	if (conf_disabled())
+		return;
+
+	path = conf_path();
+	group = conf_group(sdi);
+	chans = conf_channels_string(sdi);
+
+	kf = g_key_file_new();
+	g_key_file_set_integer(kf, group, "version", VLLOGIC_CONF_VERSION);
+	g_key_file_set_double(kf, group, "threshold",
+			((struct dev_context *)sdi->priv)->cur_threshold);
+	g_key_file_set_uint64(kf, group, "samplerate",
+			((struct dev_context *)sdi->priv)->samplerate);
+	g_key_file_set_uint64(kf, group, "limit_samples",
+			((struct dev_context *)sdi->priv)->limit_samples);
+	g_key_file_set_string(kf, group, "channels", chans);
+
+	data = g_key_file_to_data(kf, &len, NULL);
+	if (!g_file_set_contents(path, data, (gssize)len, &err)) {
+		sr_warn("config: cannot write %s (%s); settings will not "
+			"persist.", path, err ? err->message : "unknown");
+		g_clear_error(&err);
+	}
+
+	g_free(data);
+	g_key_file_free(kf);
+	g_free(chans);
+	g_free(group);
+	g_free(path);
+}
+
+/* ------------------------------------------------------------------------- */
 /* Device life cycle                                                         */
 /* ------------------------------------------------------------------------- */
 
@@ -347,6 +700,9 @@ static int dev_open(struct sr_dev_inst *sdi)
 	}
 
 	devc->usb_ctx = drvc->sr_ctx->libusb_ctx;
+
+	/* Restore this device's persisted settings, if any. */
+	vllogic_conf_load(sdi);
 
 	/* Probe is per session: forget any value from a previous run. */
 	devc->measured_bps = 0;
@@ -498,6 +854,10 @@ static int config_get(uint32_t key, GVariant **data,
 		return SR_ERR_NA;
 	}
 
+	if (key == SR_CONF_SAMPLERATE || key == SR_CONF_LIMIT_SAMPLES ||
+	    key == SR_CONF_VOLTAGE_THRESHOLD)
+		vllogic_conf_save((struct sr_dev_inst *)sdi);
+
 	return SR_OK;
 }
 
@@ -609,6 +969,21 @@ static int config_set(uint32_t key, GVariant *data,
 	default:
 		return SR_ERR_NA;
 	}
+
+	if (key == SR_CONF_SAMPLERATE || key == SR_CONF_LIMIT_SAMPLES ||
+	    key == SR_CONF_VOLTAGE_THRESHOLD)
+		vllogic_conf_save((struct sr_dev_inst *)sdi);
+
+	return SR_OK;
+}
+
+static int config_channel_set(const struct sr_dev_inst *sdi,
+		struct sr_channel *ch, unsigned int changes)
+{
+	(void)ch;
+
+	if (sdi && (changes & SR_CHANNEL_SET_ENABLED))
+		vllogic_conf_save((struct sr_dev_inst *)sdi);
 
 	return SR_OK;
 }
@@ -1132,6 +1507,7 @@ static struct sr_dev_driver vllogic_logic_driver_info = {
 	.config_get = config_get,
 	.config_set = config_set,
 	.config_list = config_list,
+	.config_channel_set = config_channel_set,
 	.dev_open = dev_open,
 	.dev_close = dev_close,
 	.dev_acquisition_start = dev_acquisition_start,
