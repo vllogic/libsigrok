@@ -433,19 +433,16 @@ static void conf_set_channels(struct sr_dev_inst *sdi, const gboolean *want)
 }
 
 /* Rough admission check: full precision happens at start-up. */
-static gboolean conf_bandwidth_ok(const struct sr_dev_inst *sdi,
-		uint64_t rate, int nchan)
+/* Static link ceiling: 350 MB/s on SuperSpeed, 35 on HighSpeed, 5 else. */
+static uint64_t conf_link_limit(const struct sr_dev_inst *sdi)
 {
-	struct dev_context *devc = sdi->priv;
 	struct sr_usb_dev_inst *usb = sdi->conn;
 	libusb_device *udev = (usb && usb->devhdl) ?
 			libusb_get_device(usb->devhdl) : NULL;
 	int speed = udev ? libusb_get_device_speed(udev) : -1;
-	uint64_t required = rate * (uint64_t)nchan / 8u;
 	uint64_t limit = 5ull * 1000 * 1000;
 	const char *env = getenv("VLLOGIC_MAX_MBPS");
 
-	(void)devc;
 	if (speed == LIBUSB_SPEED_SUPER || speed == LIBUSB_SPEED_SUPER_PLUS)
 		limit = 350ull * 1000 * 1000;
 	else if (speed == LIBUSB_SPEED_HIGH)
@@ -458,7 +455,52 @@ static gboolean conf_bandwidth_ok(const struct sr_dev_inst *sdi,
 			limit = o;
 	}
 
-	return required <= limit;
+	return limit;
+}
+
+/*
+ * Wire rate for a samplerate entry: decimation is applied in the host, the
+ * ISERDES still runs at VLLOGIC_CLOCK_HZ / div.  The 1/2.5/5/10 MHz entries
+ * all use div=120, i.e. 20 MHz on the wire - never the lower output rate.
+ */
+static uint64_t conf_hw_rate(uint64_t rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < VLLOGIC_NUM_RATES; i++)
+		if (vllogic_rates[i].rate == rate)
+			return VLLOGIC_CLOCK_HZ / vllogic_rates[i].div;
+
+	return VLLOGIC_CLOCK_HZ / VLLOGIC_DIV_MAX;
+}
+
+static gboolean conf_bandwidth_ok(const struct sr_dev_inst *sdi,
+		uint64_t rate, int nchan)
+{
+	uint64_t required = conf_hw_rate(rate) * (uint64_t)nchan / 8u;
+
+	return required <= conf_link_limit(sdi);
+}
+
+/* Highest entry in vllogic_rates[] the selected channels can sustain. */
+static uint64_t conf_max_rate_for(const struct sr_dev_inst *sdi, int nchan)
+{
+	uint64_t limit = conf_link_limit(sdi);
+	int i;
+
+	for (i = (int)VLLOGIC_NUM_RATES - 1; i >= 0; i--) {
+		uint64_t rate = vllogic_rates[i].rate;
+		uint64_t hw = VLLOGIC_CLOCK_HZ / vllogic_rates[i].div;
+
+		if (nchan <= vllogic_max_channels(rate) &&
+		    hw * (uint64_t)nchan / 8u <= limit)
+			return rate;
+	}
+
+	sr_warn("config: no samplerate fits %d channels within %" PRIu64
+		" MB/s; using the lowest entry.", nchan, limit / 1000000);
+
+	return vllogic_rates[0].rate;
 }
 
 /**
@@ -504,17 +546,6 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
 		want[i] = TRUE;
 
-	/* samplerate (per-key fallback) */
-	rate = g_key_file_get_uint64(kf, group, "samplerate", NULL);
-	if (rate == 0 || !conf_rate_valid(rate)) {
-		sr_warn("config: samplerate %" G_GUINT64_FORMAT " is not "
-			"supported; using %" G_GUINT64_FORMAT " Hz.",
-			rate, (uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
-		rate = VLLOGIC_CONF_DEFAULT_RATE;
-		fellback = TRUE;
-	}
-	(void)conf_apply_rate(devc, rate);
-
 	/* channels (per-key fallback) */
 	chans = g_key_file_get_string(kf, group, "channels", NULL);
 	if (chans && *chans) {
@@ -550,6 +581,19 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 		nchan = VLLOGIC_NUM_CHANNELS;
 	}
 
+	/* samplerate (per-key fallback) */
+	rate = g_key_file_get_uint64(kf, group, "samplerate", NULL);
+	if (rate == 0 || !conf_rate_valid(rate)) {
+		uint64_t best = conf_max_rate_for(sdi, nchan);
+
+		sr_warn("config: samplerate %" G_GUINT64_FORMAT " is not "
+			"supported; using %" G_GUINT64_FORMAT " Hz (max for "
+			"%d ch).", rate, best, nchan);
+		rate = best;
+		fellback = TRUE;
+	}
+	(void)conf_apply_rate(devc, rate);
+
 	/* limit_samples: uint64, no invalid values */
 	devc->limit_samples = g_key_file_get_uint64(kf, group,
 			"limit_samples", NULL);
@@ -578,11 +622,12 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	 */
 	if (nchan > vllogic_max_channels(rate) ||
 	    !conf_bandwidth_ok(sdi, rate, nchan)) {
+		uint64_t best = conf_max_rate_for(sdi, nchan);
+
 		sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch exceeds the "
 			"link cap; samplerate lowered to %" G_GUINT64_FORMAT
-			" Hz.", rate, nchan,
-			(uint64_t)VLLOGIC_CONF_DEFAULT_RATE);
-		rate = VLLOGIC_CONF_DEFAULT_RATE;
+			" Hz (max for %d ch).", rate, nchan, best, nchan);
+		rate = best;
 		(void)conf_apply_rate(devc, rate);
 		fellback = TRUE;
 
@@ -595,6 +640,20 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 				want[i] = TRUE;
 			nchan = VLLOGIC_NUM_CHANNELS;
 			fellback = TRUE;
+
+			/*
+			 * Decimation cannot lower the wire rate (every
+			 * 1/2.5/5/10 MHz entry still runs at 20 MHz), so
+			 * the link cap may remain unsatisfied.  Leave the
+			 * settings as loaded and let the start-time check
+			 * refuse until the user cuts channels/rate.
+			 */
+			if (!conf_bandwidth_ok(sdi, rate, nchan))
+				sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch "
+					"still exceeds the link cap; capture "
+					"start will be refused until the channel "
+					"count or samplerate is reduced.",
+					rate, nchan);
 		}
 	}
 	devc->samplerate = rate;
@@ -1298,7 +1357,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	 */
 	{
 		struct sr_usb_dev_inst *usb = sdi->conn;
-		uint64_t required = devc->samplerate *
+		uint64_t required = (VLLOGIC_CLOCK_HZ / devc->div) *
 				(uint64_t)nlogical / 8u;
 		uint64_t limit;
 		const char *source;
