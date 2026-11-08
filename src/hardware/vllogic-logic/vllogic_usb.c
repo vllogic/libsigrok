@@ -32,11 +32,8 @@
 #include <config.h>
 
 #include <errno.h>
-#include <pthread.h>
-#include <semaphore.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <time.h>
 
 #include <glib.h>
 #include <libusb.h>
@@ -107,8 +104,8 @@ struct vllogic_rx {
 	struct vllogic_chunk *parser_spare;	/* parser thread only */
 	GQueue *spare_chunks;		/* overflow parking, never drop a pointer */
 
-	pthread_t ev_thread;
-	pthread_t parser_thread;
+	GThread *ev_thread;
+	GThread *parser_thread;
 	int threads_started;
 
 	atomic_int stopping;
@@ -126,7 +123,9 @@ struct vllogic_rx {
 	int first_checked;
 	unsigned int last_drop_blocks;
 	char first_msg[160];
-	sem_t rx_sem;
+	GMutex rx_mutex;
+	GCond rx_cond;
+	gboolean rx_pending;
 
 	unsigned int chunks_pushed;	/* must equal VLLOGIC_CHUNK_COUNT */
 	struct uhsif_parser parser;
@@ -350,6 +349,18 @@ static size_t rx_sink_write(void *user, const uint8_t *data, size_t len)
 /* libusb IN callbacks and event thread                                      */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Wake the parser thread.  A plain flag plus GCond replaces the POSIX
+ * semaphore so the driver builds on Windows and macOS as well.
+ */
+static void rx_notify(struct vllogic_rx *rx)
+{
+	g_mutex_lock(&rx->rx_mutex);
+	rx->rx_pending = TRUE;
+	g_cond_signal(&rx->rx_cond);
+	g_mutex_unlock(&rx->rx_mutex);
+}
+
 static int urb_submit(struct vllogic_rx *rx, struct vllogic_urb *u)
 {
 	int ret = libusb_submit_transfer(u->xfer);
@@ -447,7 +458,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *t)
 				if (!rx->ev_spare)
 					rx->ev_spare = old;
 			} else {
-				sem_post(&rx->rx_sem);
+				rx_notify(rx);
 			}
 		}
 		return;
@@ -460,7 +471,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *t)
 	 */
 	if (len > 0 && u->cur && status != LIBUSB_TRANSFER_NO_DEVICE) {
 		if (rx_push(&rx->rx_ring, u->cur, (uint32_t)len, status) == 0) {
-			sem_post(&rx->rx_sem);
+			rx_notify(rx);
 		} else {
 			atomic_fetch_add_explicit(&rx->dropped_bytes, (uint64_t)len, memory_order_relaxed);
 			if (!rx->ev_spare)
@@ -470,7 +481,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *t)
 	u->cur = NULL;
 }
 
-static void *event_thread(void *arg)
+static gpointer event_thread(gpointer arg)
 {
 	struct vllogic_rx *rx = arg;
 	int ok = 1;
@@ -512,7 +523,7 @@ static void *event_thread(void *arg)
 /* Parser thread                                                             */
 /* ------------------------------------------------------------------------- */
 
-static void *parser_thread(void *arg)
+static gpointer parser_thread(gpointer arg)
 {
 	struct vllogic_rx *rx = arg;
 	struct rx_item it;
@@ -542,15 +553,20 @@ static void *parser_thread(void *arg)
 			break;
 
 		{
-			struct timespec ts;
+			gint64 deadline;
 
-			clock_gettime(CLOCK_REALTIME, &ts);
-			ts.tv_nsec += 20 * 1000 * 1000;
-			if (ts.tv_nsec >= 1000000000L) {
-				ts.tv_sec++;
-				ts.tv_nsec -= 1000000000L;
+			g_mutex_lock(&rx->rx_mutex);
+			if (!rx->rx_pending) {
+				deadline = g_get_monotonic_time() +
+						20 * G_TIME_SPAN_MILLISECOND;
+				while (!rx->rx_pending) {
+					if (!g_cond_wait_until(&rx->rx_cond,
+							&rx->rx_mutex, deadline))
+						break;
+				}
 			}
-			sem_timedwait(&rx->rx_sem, &ts);
+			rx->rx_pending = FALSE;
+			g_mutex_unlock(&rx->rx_mutex);
 		}
 	}
 
@@ -594,7 +610,9 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 	atomic_init(&rx->dropped_bytes, 0);
 	rx->expected_div = devc->div;
 	rx->expected_mask = map->mask;
-	sem_init(&rx->rx_sem, 0, 0);
+	g_mutex_init(&rx->rx_mutex);
+	g_cond_init(&rx->rx_cond);
+	rx->rx_pending = FALSE;
 
 	rx->bufs = g_malloc0(rx->buf_count * sizeof(*rx->bufs));
 	for (i = 0; i < rx->buf_count; i++)
@@ -692,12 +710,14 @@ void vllogic_rx_free(struct vllogic_rx *rx)
 	g_free(rx->chunk_free.slots);
 	g_free(rx->chunk_filled.slots);
 	g_free(rx->rx_ring.slots);
-	sem_destroy(&rx->rx_sem);
+	g_cond_clear(&rx->rx_cond);
+	g_mutex_clear(&rx->rx_mutex);
 	g_free(rx);
 }
 
 int vllogic_rx_start(struct vllogic_rx *rx)
 {
+	GError *err = NULL;
 	int waited;
 
 	atomic_store_explicit(&rx->stopping, 0, memory_order_relaxed);
@@ -705,12 +725,19 @@ int vllogic_rx_start(struct vllogic_rx *rx)
 	atomic_store_explicit(&rx->parser_exit, 0, memory_order_relaxed);
 	atomic_store_explicit(&rx->ev_ready, 0, memory_order_relaxed);
 
-	if (pthread_create(&rx->ev_thread, NULL, event_thread, rx) != 0) {
-		sr_err("Failed to start USB event thread.");
+	rx->ev_thread = g_thread_try_new("vllogic-evt", event_thread, rx, &err);
+	if (!rx->ev_thread) {
+		sr_err("Failed to start USB event thread: %s",
+			err ? err->message : "unknown error");
+		g_clear_error(&err);
 		return SR_ERR;
 	}
-	if (pthread_create(&rx->parser_thread, NULL, parser_thread, rx) != 0) {
-		sr_err("Failed to start UHSIF parser thread.");
+	rx->parser_thread = g_thread_try_new("vllogic-rx", parser_thread, rx,
+			&err);
+	if (!rx->parser_thread) {
+		sr_err("Failed to start UHSIF parser thread: %s",
+			err ? err->message : "unknown error");
+		g_clear_error(&err);
 		/*
 		 * The event thread has already submitted up to 16 IN URBs.
 		 * Cancel and drain them before joining, otherwise rx_free()
@@ -752,7 +779,8 @@ int vllogic_rx_start(struct vllogic_rx *rx)
 					memory_order_relaxed);
 		}
 		atomic_store_explicit(&rx->ev_exit, 1, memory_order_relaxed);
-		pthread_join(rx->ev_thread, NULL);
+		g_thread_join(rx->ev_thread);
+		rx->ev_thread = NULL;
 		if (atomic_load_explicit(&rx->in_flight,
 					 memory_order_acquire) != 0) {
 			sr_err("IN transfers survived parser thread failure; "
@@ -826,7 +854,8 @@ void vllogic_rx_stop(struct vllogic_rx *rx)
 	}
 
 	atomic_store_explicit(&rx->ev_exit, 1, memory_order_relaxed);
-	pthread_join(rx->ev_thread, NULL);
+	g_thread_join(rx->ev_thread);
+	rx->ev_thread = NULL;
 	if (atomic_load_explicit(&rx->in_flight, memory_order_acquire) != 0) {
 		sr_err("IN transfers still active after joining the event "
 			"thread; marking the pipeline abandoned.");
@@ -835,8 +864,9 @@ void vllogic_rx_stop(struct vllogic_rx *rx)
 
 	/* No more producers: let the parser drain the ring and exit. */
 	atomic_store_explicit(&rx->parser_exit, 1, memory_order_relaxed);
-	sem_post(&rx->rx_sem);
-	pthread_join(rx->parser_thread, NULL);
+	rx_notify(rx);
+	g_thread_join(rx->parser_thread);
+	rx->parser_thread = NULL;
 
 	rx->threads_started = 0;
 }
@@ -1103,7 +1133,7 @@ int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 		uint64_t *bps)
 {
 	uint8_t *buf;
-	struct timespec t0, t1;
+	gint64 t0;
 	uint64_t bytes = 0;
 	int64_t deadline_us;
 	int ret = SR_ERR;
@@ -1133,7 +1163,7 @@ int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 		goto out;
 	started = TRUE;
 
-	clock_gettime(CLOCK_MONOTONIC, &t0);
+	t0 = g_get_monotonic_time();
 	deadline_us = (int64_t)window_ms * 1000;
 
 	for (;;) {
@@ -1141,9 +1171,7 @@ int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 		int r;
 		int64_t elapsed_us;
 
-		clock_gettime(CLOCK_MONOTONIC, &t1);
-		elapsed_us = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
-				(t1.tv_nsec - t0.tv_nsec) / 1000;
+		elapsed_us = (int64_t)(g_get_monotonic_time() - t0);
 		if (elapsed_us >= deadline_us)
 			break;
 
@@ -1157,10 +1185,8 @@ int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 			bytes += (uint64_t)transferred;
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &t1);
 	{
-		int64_t elapsed_us = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
-				(t1.tv_nsec - t0.tv_nsec) / 1000;
+		int64_t elapsed_us = (int64_t)(g_get_monotonic_time() - t0);
 
 		if (bytes > 0 && elapsed_us > 0) {
 			*bps = bytes * 1000000ull / (uint64_t)elapsed_us;
