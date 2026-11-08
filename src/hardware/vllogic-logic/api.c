@@ -142,7 +142,8 @@ static gboolean vllogic_match(libusb_device *dev,
 	unsigned char buf[128];
 	gboolean ok = TRUE;
 
-	if (des->bcdDevice != VLLOGIC_BCD_LOGIC20)
+	if (des->bcdDevice < VLLOGIC_BCD_LOGIC20_MIN ||
+	    des->bcdDevice > VLLOGIC_BCD_LOGIC20_MAX)
 		return FALSE;
 
 	if (libusb_open(dev, &hdl) != 0) {
@@ -248,7 +249,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 
 		if (usb_get_port_path(devlist[i], connection_id,
 				      (int)sizeof(connection_id)) < 0)
-			g_snprintf(connection_id, sizeof(connection_id), "%d.%d",
+			g_snprintf(connection_id, sizeof(connection_id),
+				   "usb/%d-%d",
 				   libusb_get_bus_number(devlist[i]),
 				   libusb_get_device_address(devlist[i]));
 

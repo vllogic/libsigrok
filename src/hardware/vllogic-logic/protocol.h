@@ -41,7 +41,13 @@
 
 #define VLLOGIC_VID			0x1209
 #define VLLOGIC_PID			0x6688
-#define VLLOGIC_BCD_LOGIC20		0x0820
+/*
+ * Logic20 firmware bumps bcdDevice with every release (0x0820, 0x0824,
+ * 0x0826, ...), so match a range instead of one exact value.  USB Sniffer 2
+ * reports 0x0602 and is therefore excluded automatically.
+ */
+#define VLLOGIC_BCD_LOGIC20_MIN		0x0820
+#define VLLOGIC_BCD_LOGIC20_MAX		0x082F
 #define VLLOGIC_BCD_SNIFFER2		0x0602
 #define VLLOGIC_PRODUCT_LOGIC20		"Logic20"
 #define VLLOGIC_IFACE			0
