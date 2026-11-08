@@ -142,8 +142,7 @@ static gboolean vllogic_match(libusb_device *dev,
 	unsigned char buf[128];
 	gboolean ok = TRUE;
 
-	if (des->bcdDevice < VLLOGIC_BCD_LOGIC20_MIN ||
-	    des->bcdDevice > VLLOGIC_BCD_LOGIC20_MAX)
+	if (des->bcdDevice != VLLOGIC_BCD_LOGIC20)
 		return FALSE;
 
 	if (libusb_open(dev, &hdl) != 0) {
@@ -165,6 +164,35 @@ static gboolean vllogic_match(libusb_device *dev,
 				       (const char *)buf, des->bcdDevice);
 				ok = FALSE;
 			}
+		}
+	}
+
+	/*
+	 * Interface 0 is the only interface this driver drives.  Interface 1
+	 * is the DLDO control interface and must never be opened or claimed,
+	 * so reject a device that has no Interface 0 while the handle is
+	 * already open (claim fails with NOT_FOUND).
+	 */
+	if (ok) {
+		int ir = libusb_claim_interface(hdl, VLLOGIC_IFACE);
+
+		if (ir == 0) {
+			libusb_release_interface(hdl, VLLOGIC_IFACE);
+			sr_dbg("Accepted Interface 0 (bcdDevice 0x%04x).",
+			       des->bcdDevice);
+		} else if (ir == LIBUSB_ERROR_NOT_FOUND) {
+			sr_dbg("Ignoring Interface 1 (no Interface 0) on "
+			       "bcdDevice 0x%04x.", des->bcdDevice);
+			ok = FALSE;
+		} else {
+			/*
+			 * BUSY / ACCESS: another driver holds it, so the
+			 * interface layout cannot be judged here.  Keep the
+			 * device and let dev_open() report the conflict.
+			 */
+			sr_dbg("Cannot claim Interface 0 (%s); keeping the "
+			       "device for dev_open().",
+			       libusb_error_name(ir));
 		}
 	}
 
