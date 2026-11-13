@@ -113,6 +113,8 @@ struct vllogic_map {
 	int unitsize;			/**< Bytes per sample in SR_DF_LOGIC. */
 	int phys_list[VLLOGIC_NUM_CHANNELS];	/**< Ascending physical lanes. */
 	int8_t phys2log[VLLOGIC_NUM_CHANNELS];	/**< Physical lane -> logical. */
+	int8_t word_of_logical[VLLOGIC_NUM_CHANNELS]; /**< Logical -> snap index. */
+	uint8_t lane_used;		/**< Output byte lanes carrying channels. */
 };
 
 /* -- Pure protocol helpers (protocol.c) ----------------------------------- */

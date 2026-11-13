@@ -156,8 +156,10 @@ int vllogic_map_build(const int *logical, int nlogical,
 		return -1;
 
 	memset(map, 0, sizeof(*map));
-	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
+	for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++) {
 		map->phys2log[i] = -1;
+		map->word_of_logical[i] = -1;
+	}
 
 	for (i = 0; i < nlogical; i++) {
 		ch = logical[i];
@@ -180,11 +182,14 @@ int vllogic_map_build(const int *logical, int nlogical,
 		for (i = 0; i < nlogical; i++) {
 			if (channel_perm[logical[i]] == ch) {
 				map->phys2log[ch] = (int8_t)logical[i];
+				map->word_of_logical[logical[i]] =
+					(int8_t)(map->nchan - 1);
 				break;
 			}
 		}
 		if (map->phys2log[ch] < 0)
 			return -1;
+		map->lane_used |= (uint8_t)(1u << (map->phys2log[ch] >> 3));
 	}
 
 	return 0;

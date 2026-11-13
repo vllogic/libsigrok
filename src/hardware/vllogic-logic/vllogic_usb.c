@@ -33,6 +33,7 @@
 
 #include <errno.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <glib.h>
@@ -668,6 +669,22 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 
 	uhsif_parser_init(&rx->parser, map, limit_samples, devc->decimate,
 			&rx_sink, rx);
+	/*
+	 * Coalesce expanded output before waking the sink.  A 1.2 GSa/s
+	 * single-lane capture produces 37.5M 32-sample snapshots/s; writing
+	 * each one directly costs an atomic add and a 32-byte copy per
+	 * snapshot.  VLLOGIC_BATCH_BYTES=0 restores the legacy behaviour.
+	 */
+	{
+		unsigned int batch = UHSIF_OUT_BATCH_DEFAULT;
+		const char *env = getenv("VLLOGIC_BATCH_BYTES");
+
+		if (env && *env)
+			batch = (unsigned int)strtoul(env, NULL, 10);
+		uhsif_parser_set_batch(&rx->parser, batch);
+		sr_info("parser: output batch %u bytes (max %u).",
+			rx->parser.batch_bytes, UHSIF_OUT_BATCH_MAX);
+	}
 	return rx;
 }
 

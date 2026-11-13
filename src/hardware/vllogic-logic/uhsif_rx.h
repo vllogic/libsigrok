@@ -37,6 +37,15 @@
 
 #include "protocol.h"
 
+/**
+ * Maximum expanded-output buffer the parser may coalesce before calling
+ * the sink.  With the default 1024-byte batch, a 1.2 GSa/s single-lane
+ * capture drops from 37.5M sink calls/s to ~1.2M calls/s.
+ */
+#define UHSIF_OUT_BATCH_MAX	8192
+/** Default coalescing size; 0 disables batching (legacy behaviour). */
+#define UHSIF_OUT_BATCH_DEFAULT	1024
+
 /** Parser / link statistics, see la_recv.c:649-707. */
 struct uhsif_stats {
 	uint64_t blocks;		/**< All CRC-valid blocks. */
@@ -87,6 +96,18 @@ struct uhsif_parser {
 	 */
 	unsigned int decimate;
 
+	/** Allow the AVX2 multi-lane expander when the CPU supports it. */
+	int use_avx2;
+
+	/**
+	 * Output coalescing: expanded snapshots are accumulated here and
+	 * handed to the sink in larger blocks.  0 = write each snapshot
+	 * directly (the legacy behaviour).
+	 */
+	unsigned int batch_bytes;
+	unsigned int out_len;
+	uint8_t out_buf[UHSIF_OUT_BATCH_MAX];
+
 	/** Bytes to rescan before the current input, see parser_header(). */
 	uint8_t replay[UHSIF_HDR_SIZE];
 	unsigned int replay_len;
@@ -118,6 +139,12 @@ struct uhsif_parser {
 void uhsif_parser_init(struct uhsif_parser *p, const struct vllogic_map *map,
 		uint64_t limit_samples, unsigned int decimate,
 		const struct uhsif_sink *sink, void *sink_user);
+/**
+ * Coalesce expanded output into @a bytes-sized blocks before calling the
+ * sink.  0 restores the legacy per-snapshot writes.  Values are clamped to
+ * UHSIF_OUT_BATCH_MAX.
+ */
+void uhsif_parser_set_batch(struct uhsif_parser *p, unsigned int bytes);
 void uhsif_parser_feed(struct uhsif_parser *p, const uint8_t *data, size_t len);
 /**
  * Enable dropping the leading (pre-START pipeline) payload word.

@@ -24,9 +24,89 @@
 
 #include "uhsif_rx.h"
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define UHSIF_HAVE_AVX2 1
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                             */
 /* ------------------------------------------------------------------------- */
+
+#if defined(UHSIF_HAVE_AVX2)
+
+static int parser_avx2_available(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		__builtin_cpu_init();
+		cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+	}
+	return cached;
+}
+
+__attribute__((target("avx2")))
+static inline uint32_t avx2_bit_mask(__m256i y, int b)
+{
+	return (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(
+		_mm256_sll_epi32(y, _mm_cvtsi32_si128(31 - b))));
+}
+
+/*
+ * Expand up to 24 logical channels into the same lbytes[3][32] layout the
+ * scalar path produces.  Each vector lane is one logical channel, so one
+ * shift+movemask yields eight channel bits of one time point.  Only the
+ * output byte lanes that actually carry a channel are computed: sparse
+ * selections (e.g. ch18-19) skip two thirds of the work.
+ */
+__attribute__((target("avx2")))
+static void expand_avx2(const uint32_t *snap, const struct vllogic_map *map,
+			int unit, uint8_t lbytes[3][32])
+{
+	const int8_t *wol = map->word_of_logical;
+	uint32_t s[24] = { 0 };
+	__m256i y;
+	int ch, b, lane;
+
+	for (ch = 0; ch < 24; ch++) {
+		int idx = ch < VLLOGIC_NUM_CHANNELS ? wol[ch] : -1;
+
+		if (idx >= 0)
+			s[ch] = snap[idx];
+	}
+
+	/*
+	 * The generic interleave reads every lane below unit.  For sparse
+	 * selections that are not one of the specialised single-lane cases
+	 * (e.g. lane0+lane2), zero the lanes that are not computed.
+	 */
+	if (map->lane_used != 1u && map->lane_used != 2u &&
+	    map->lane_used != 4u &&
+	    (map->lane_used & (uint8_t)((1u << unit) - 1u)) !=
+		    (uint8_t)((1u << unit) - 1u))
+		memset(lbytes, 0, 3 * 32);
+
+	for (lane = 0; lane < unit; lane++) {
+		if (!(map->lane_used & (1u << lane)))
+			continue;
+		y = _mm256_setr_epi32(s[lane * 8 + 0], s[lane * 8 + 1],
+				s[lane * 8 + 2], s[lane * 8 + 3],
+				s[lane * 8 + 4], s[lane * 8 + 5],
+				s[lane * 8 + 6], s[lane * 8 + 7]);
+		for (b = 0; b < 32; b++)
+			lbytes[lane][b] = (uint8_t)avx2_bit_mask(y, b);
+	}
+}
+
+#else
+
+static int parser_avx2_available(void)
+{
+	return 0;
+}
+
+#endif
 
 static uint32_t rd32le(const uint8_t *p)
 {
@@ -74,45 +154,174 @@ static void wr32le(uint8_t *p, uint32_t v)
 /* ------------------------------------------------------------------------- */
 
 /**
- * Expand one snapshot into wire-order sample bytes and hand it to the sink.
- * Port of la_recv.c:575-611 (emit_snapshot), with limit_samples handling.
+ * Flush the coalescing buffer to the sink.
+ *
+ * samples_out is advanced here (not in emit_snapshot) so that a short
+ * sink write only counts the whole samples it actually accepted.
  */
+static void parser_flush_out(struct uhsif_parser *p)
+{
+	size_t want = p->out_len;
+	size_t got;
+
+	p->out_len = 0;
+	if (want == 0 || !p->sink || !p->sink->write)
+		return;
+
+	got = p->sink->write(p->sink_user, p->out_buf, want);
+	if (got < want) {
+		p->st.sink_short++;
+		p->st.sink_short_bytes += (uint64_t)(want - got);
+	}
+	p->samples_out += (uint64_t)got / (uint64_t)p->map->unitsize;
+}
+
+/**
+ * Hand expanded samples to the sink, either directly or through the
+ * coalescing buffer.  The batch amortises the sink's atomic accounting and
+ * memcpy: at 1.2 GSa/s a snapshot is only 32 samples, so per-snapshot writes
+ * would mean 37.5M sink calls per second.
+ */
+static void parser_write_out(struct uhsif_parser *p, const uint8_t *data,
+		size_t len)
+{
+	size_t unit = (size_t)p->map->unitsize;
+	size_t got;
+
+	if (len == 0 || !p->sink || !p->sink->write)
+		return;
+
+	if (p->batch_bytes == 0 || len > p->batch_bytes) {
+		got = p->sink->write(p->sink_user, data, len);
+		if (got < len) {
+			p->st.sink_short++;
+			p->st.sink_short_bytes += (uint64_t)(len - got);
+		}
+		p->samples_out += (uint64_t)got / (uint64_t)unit;
+		return;
+	}
+
+	if ((size_t)p->out_len + len > p->batch_bytes)
+		parser_flush_out(p);
+	memcpy(p->out_buf + p->out_len, data, len);
+	p->out_len += (unsigned int)len;
+}
+
+/**
+ * Fast path for one logical lane with no decimation.
+ *
+ * This is the 1200 MSa/s single-channel case.  The generic AVX2 expander
+ * has to build 24 logical lanes and leaves 7/8 of each vector empty, which
+ * is slower than expand8[] here.  Any channel number (unit 1/2/3) is
+ * supported; the output lane/bit come from the logical channel.
+ */
+static void emit_single_snapshot(struct uhsif_parser *p)
+{
+	uint32_t w = p->snap[0];
+	const struct vllogic_map *map = p->map;
+	int logical = map->phys2log[map->phys_list[0]];
+	int unit = map->unitsize;
+	int lane = logical >> 3;
+	int bit = logical & 7;
+	uint64_t m = (uint64_t)1 << bit;
+	uint8_t tmp[3 * 32];
+	size_t samples = 32;
+	size_t n;
+	int s, k;
+
+	if (unit == 1) {
+		for (k = 0; k < 4; k++) {
+			uint64_t e = p->expand8[(w >> (k * 8)) & 0xFFu] * m;
+
+			memcpy(tmp + k * 8, &e, 8);
+		}
+	} else {
+		memset(tmp, 0, sizeof(tmp));
+		for (s = 0; s < 32; s++)
+			tmp[(size_t)s * (size_t)unit + (size_t)lane] =
+				(uint8_t)((((w >> s) & 1u) << bit));
+	}
+	n = samples * (size_t)unit;
+
+	if (p->limit_samples != 0) {
+		uint64_t done = p->samples_out +
+			p->out_len / (unsigned int)unit;
+		uint64_t rem;
+
+		if (done >= p->limit_samples) {
+			p->limit_reached = 1;
+			parser_flush_out(p);
+			if (p->sink && p->sink->flush)
+				p->sink->flush(p->sink_user);
+			return;
+		}
+		rem = p->limit_samples - done;
+		if ((uint64_t)samples > rem) {
+			samples = (size_t)rem;
+			n = samples * (size_t)unit;
+		}
+	}
+
+	parser_write_out(p, tmp, n);
+
+	if (p->limit_samples != 0 &&
+	    p->samples_out + p->out_len / (unsigned int)unit >=
+		    p->limit_samples) {
+		p->limit_reached = 1;
+		parser_flush_out(p);
+		if (p->sink && p->sink->flush)
+			p->sink->flush(p->sink_user);
+	}
+}
+
 static void emit_snapshot(struct uhsif_parser *p)
 {
 	uint64_t lanes[3][4];
 	uint8_t lbytes[3][32];
-	uint8_t out[3 * 32];
+	uint8_t out[3 * 32 + 4];
 	const struct vllogic_map *map = p->map;
 	unsigned int dec = p->decimate ? p->decimate : 1;
 	int nchan = map->nchan;
 	int unit = map->unitsize;
 	int g, k, j, s, lane, bit, emitted = 0;
+	int sparse3 = (unit == 3 && map->lane_used == 4);
+	int sparse2 = (unit == 2 && map->lane_used == 2);
 	uint64_t m;
+	uint64_t pending;
 
 	if (p->limit_reached)
 		return;
 
-	memset(lanes, 0, sizeof(lanes));
-	for (g = 0; g < nchan; g++) {
-		uint32_t w = p->snap[g];
-		int logical = map->phys2log[map->phys_list[g]];
+	pending = (uint64_t)(p->out_len / (unsigned int)unit);
 
-		lane = logical >> 3;
-		bit = logical & 7;
-		m = (uint64_t)1 << bit;
+#if defined(UHSIF_HAVE_AVX2)
+	if (p->use_avx2 && parser_avx2_available()) {
+		expand_avx2(p->snap, map, unit, lbytes);
+	} else
+#endif
+	{
+		memset(lanes, 0, sizeof(lanes));
+		for (g = 0; g < nchan; g++) {
+			uint32_t w = p->snap[g];
+			int logical = map->phys2log[map->phys_list[g]];
 
-		for (k = 0; k < 4; k++)
-			lanes[lane][k] |=
-				p->expand8[(w >> (k * 8)) & 0xFFu] * m;
-	}
+			lane = logical >> 3;
+			bit = logical & 7;
+			m = (uint64_t)1 << bit;
 
-	for (lane = 0; lane < unit; lane++) {
-		for (k = 0; k < 4; k++) {
-			uint64_t v = lanes[lane][k];
+			for (k = 0; k < 4; k++)
+				lanes[lane][k] |=
+					p->expand8[(w >> (k * 8)) & 0xFFu] * m;
+		}
 
-			for (j = 0; j < 8; j++)
-				lbytes[lane][k * 8 + j] =
-					(uint8_t)(v >> (j * 8));
+		for (lane = 0; lane < unit; lane++) {
+			for (k = 0; k < 4; k++) {
+				uint64_t v = lanes[lane][k];
+
+				for (j = 0; j < 8; j++)
+					lbytes[lane][k * 8 + j] =
+						(uint8_t)(v >> (j * 8));
+			}
 		}
 	}
 
@@ -123,38 +332,61 @@ static void emit_snapshot(struct uhsif_parser *p)
 	 * and no cross-snapshot state is needed.
 	 * limit_samples counts these output samples.
 	 */
-	for (s = 0; s < 32; s += (int)dec) {
-		if (p->limit_samples != 0 &&
-		    p->samples_out + (uint64_t)emitted >= p->limit_samples) {
-			p->limit_reached = 1;
-			break;
-		}
-		{
-			uint8_t *o = out + (size_t)emitted * (size_t)unit;
+	if (p->limit_samples == 0) {
+		if (sparse3) {
+			for (s = 0; s < 32; s += (int)dec) {
+				uint8_t *o = out +
+					(size_t)emitted * (size_t)unit;
+				uint32_t v = (uint32_t)lbytes[2][s] << 16;
 
-			for (j = 0; j < unit; j++)
-				o[j] = lbytes[j][s];
+				/*
+				 * One unaligned 32-bit store instead of three
+				 * byte stores.  The 4th byte overlaps the next
+				 * sample and is overwritten there; out[] has 4
+				 * spare bytes for the final sample.
+				 */
+				memcpy(o, &v, 4);
+				emitted++;
+			}
+		} else if (sparse2) {
+			for (s = 0; s < 32; s += (int)dec) {
+				uint8_t *o = out +
+					(size_t)emitted * (size_t)unit;
+				uint16_t v = (uint16_t)lbytes[1][s] << 8;
+
+				memcpy(o, &v, 2);
+				emitted++;
+			}
+		} else {
+			for (s = 0; s < 32; s += (int)dec) {
+				uint8_t *o = out +
+					(size_t)emitted * (size_t)unit;
+
+				for (j = 0; j < unit; j++)
+					o[j] = lbytes[j][s];
+				emitted++;
+			}
 		}
-		emitted++;
+	} else {
+		for (s = 0; s < 32; s += (int)dec) {
+			if (p->samples_out + pending + (uint64_t)emitted >=
+			    p->limit_samples) {
+				p->limit_reached = 1;
+				break;
+			}
+			{
+				uint8_t *o = out + (size_t)emitted * (size_t)unit;
+
+				for (j = 0; j < unit; j++)
+					o[j] = lbytes[j][s];
+			}
+			emitted++;
+		}
 	}
 
-	if (emitted > 0 && p->sink && p->sink->write) {
-		size_t want = (size_t)emitted * (size_t)unit;
-		size_t got = p->sink->write(p->sink_user, out, want);
+	if (emitted > 0)
+		parser_write_out(p, out, (size_t)emitted * (size_t)unit);
 
-		if (got < want) {
-			/*
-			 * The chunk layer is behind.  Account only for the
-			 * whole samples it accepted; the rest of this
-			 * snapshot is dropped as one unit.
-			 */
-			p->st.sink_short++;
-			p->st.sink_short_bytes += (uint64_t)(want - got);
-			emitted = (int)(got / (size_t)unit);
-		}
-	}
-
-	p->samples_out += (uint64_t)emitted;
 	if (p->limit_samples != 0 && p->samples_out >= p->limit_samples)
 		p->limit_reached = 1;
 
@@ -163,13 +395,23 @@ static void emit_snapshot(struct uhsif_parser *p)
 	 * limit is reached, the session must see the tail now, otherwise it
 	 * cannot observe samples_sent >= limit and never initiates STOP.
 	 */
-	if (p->limit_reached && p->sink && p->sink->flush)
-		p->sink->flush(p->sink_user);
+	if (p->limit_reached) {
+		parser_flush_out(p);
+		if (p->sink && p->sink->flush)
+			p->sink->flush(p->sink_user);
+	}
 }
 
 static void parser_word(struct uhsif_parser *p, uint32_t w)
 {
 	p->st.payload_words++;
+
+	if (p->map->nchan == 1 && p->decimate == 1) {
+		p->snap[0] = w;
+		emit_single_snapshot(p);
+		return;
+	}
+
 	p->snap[p->snap_pos++] = w;
 	if (p->snap_pos == p->map->nchan) {
 		p->snap_pos = 0;
@@ -280,6 +522,32 @@ static void parser_feed_raw(struct uhsif_parser *p, const uint8_t *data,
 		}
 
 		if (p->state == 2) {			/* payload */
+			int nchan = p->map->nchan;
+
+			/*
+			 * Whole-snapshot fast path: read nchan words and
+			 * emit once, instead of dispatching parser_word()
+			 * per 32-bit word.  At 20 channels this is the
+			 * difference between ~350 and ~500 MSa/s.
+			 */
+			if (nchan > 1 && p->snap_pos == 0) {
+				while (p->pay_rem >= (uint32_t)nchan &&
+				       n >= (size_t)nchan * 4u) {
+					int g;
+
+					for (g = 0; g < nchan; g++)
+						p->snap[g] = rd32le(d +
+							(size_t)g * 4u);
+					d += (size_t)nchan * 4u;
+					n -= (size_t)nchan * 4u;
+					p->pay_rem -= (uint32_t)nchan;
+					p->st.payload_words +=
+						(uint64_t)nchan;
+					emit_snapshot(p);
+					if (p->limit_reached)
+						break;
+				}
+			}
 			while (p->pay_rem > 0 && n >= 4) {
 				uint32_t w = rd32le(d);
 
@@ -372,6 +640,9 @@ void uhsif_parser_finish(struct uhsif_parser *p)
 	p->drop_active = 0;
 	p->state = 0;
 
+	/* Hand the last partially filled output batch downstream. */
+	parser_flush_out(p);
+
 	/* Hand the last partially filled output chunk downstream. */
 	if (p->sink && p->sink->flush)
 		p->sink->flush(p->sink_user);
@@ -387,6 +658,7 @@ void uhsif_parser_init(struct uhsif_parser *p, const struct vllogic_map *map,
 	p->map = map;
 	p->limit_samples = limit_samples;
 	p->decimate = decimate ? decimate : 1;
+	p->use_avx2 = 1;
 	/* Only factors that divide the 32-sample snapshot are supported. */
 	if (p->decimate > 32 || (32u % p->decimate) != 0)
 		p->decimate = 1;
@@ -403,6 +675,14 @@ void uhsif_parser_init(struct uhsif_parser *p, const struct vllogic_map *map,
 		}
 		p->expand8[b] = e;
 	}
+}
+
+void uhsif_parser_set_batch(struct uhsif_parser *p, unsigned int bytes)
+{
+	if (bytes > UHSIF_OUT_BATCH_MAX)
+		bytes = UHSIF_OUT_BATCH_MAX;
+	p->batch_bytes = bytes;
+	p->out_len = 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -521,7 +801,8 @@ struct st_case {
  * straddles a block boundary - except in the cases that deliberately test
  * cross-block behaviour.
  */
-static int st_run_case(const struct st_case *tc, int verbose)
+static int st_run_case(const struct st_case *tc, int verbose,
+		unsigned int batch, int use_avx2)
 {
 	uint8_t *stream = NULL;
 	uint8_t *expect = NULL;
@@ -626,6 +907,8 @@ static int st_run_case(const struct st_case *tc, int verbose)
 	}
 
 	uhsif_parser_init(&parser, &map, tc->limit, dec, &st_sink, &ctx);
+	uhsif_parser_set_batch(&parser, batch);
+	parser.use_avx2 = use_avx2;
 
 	while (off < stream_len) {
 		size_t n = chunks[ci++ % nchunks];
@@ -1275,6 +1558,14 @@ int uhsif_selftest(int verbose)
 					12, 13, 14, 15, 16, 17, 18, 19 }, 20,
 		  0, 1, 0, 0, 0, 1 },
 		{ "unit=2 channels 5,12", { 5, 12 }, 2, 0, 0, 0, 0, 0, 1 },
+		{ "unit=1 ch7", { 7 }, 1, 0, 0, 0, 0, 0, 1 },
+		{ "unit=2 ch8", { 8 }, 1, 0, 0, 0, 0, 0, 1 },
+		{ "unit=3 ch19", { 19 }, 1, 0, 0, 0, 0, 0, 1 },
+		{ "unit=3 8ch mix", { 0, 1, 2, 3, 16, 17, 18, 19 }, 8,
+		  0, 0, 0, 0, 0, 1 },
+		{ "unit=1 ch5 dec2", { 5 }, 1, 0, 0, 0, 0, 0, 2 },
+		{ "unit=1 8ch", { 0, 1, 2, 3, 4, 5, 6, 7 }, 8,
+		  0, 0, 0, 0, 0, 1 },
 		/*
 		 * Real-hardware geometry: 4092 words per block with 20
 		 * channels is not a multiple of nchan, so snapshots straddle
@@ -1316,7 +1607,11 @@ int uhsif_selftest(int verbose)
 		ok = 0;
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		st_xs = 0x123456789ABCDEFull;
-		ret = st_run_case(&cases[i], verbose);
+		ret = st_run_case(&cases[i], verbose, 0, 0);
+		if (ret != 0)
+			ok = 0;
+		/* Exercise the coalescing and AVX2 paths (AVX2 falls back). */
+		ret = st_run_case(&cases[i], verbose, 256, 1);
 		if (ret != 0)
 			ok = 0;
 	}
