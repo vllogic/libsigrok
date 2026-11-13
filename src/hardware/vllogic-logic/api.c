@@ -525,12 +525,6 @@ static uint64_t conf_max_rate_for(const struct sr_dev_inst *sdi, int nchan)
 	return vllogic_rates[0].rate;
 }
 
-/**
- * Load <user-config-dir>/vllogic-logic/config.ini for this device.
- *
- * Invalid values fall back to defaults one key at a time; a bandwidth
- * mismatch resets the whole group (the combination is what is invalid).
- */
 static int vllogic_source_key(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -543,24 +537,13 @@ static int vllogic_source_key(const struct sr_dev_inst *sdi)
 	return devc->source_key;
 }
 
-static void conf_defaults(struct sr_dev_inst *sdi)
-{
-	struct dev_context *devc = sdi->priv;
-	GSList *l;
 
-	(void)conf_apply_rate(devc, VLLOGIC_CONF_DEFAULT_RATE);
-	devc->limit_samples = 0;
-	devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
-	devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
-	devc->cur_threshold = -2.5 + 83 * 0.05;
-	for (l = sdi->channels; l; l = l->next) {
-		struct sr_channel *ch = l->data;
-
-		if (ch->type == SR_CHANNEL_LOGIC)
-			ch->enabled = TRUE;
-	}
-}
-
+/**
+ * Load <user-config-dir>/vllogic-logic/config.ini for this device.
+ *
+ * Invalid values fall back to defaults one key at a time; a bandwidth
+ * mismatch only lowers the samplerate.
+ */
 static void vllogic_conf_load(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -573,15 +556,12 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	uint64_t rate;
 	gboolean fellback = FALSE;
 
-	if (conf_disabled()) {
-		conf_defaults(sdi);
+	if (conf_disabled())
 		return;
-	}
 
 	path = conf_path();
 	if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
-		sr_info("config: using defaults (no %s yet).", path);
-		conf_defaults(sdi);
+		sr_info("config: using current defaults (no %s yet).", path);
 		g_free(path);
 		return;
 	}
@@ -593,7 +573,6 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 			path, err ? err->message : "unknown");
 		g_clear_error(&err);
 		g_key_file_free(kf);
-		conf_defaults(sdi);
 		g_free(path);
 		return;
 	}
@@ -742,9 +721,14 @@ static void vllogic_conf_save(struct sr_dev_inst *sdi)
 
 	kf = g_key_file_new();
 	if (g_file_test(path, G_FILE_TEST_EXISTS) &&
-	    !g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
-		sr_warn("config: cannot merge %s; other device groups may "
-			"be overwritten.", path);
+	    !g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+		sr_warn("config: cannot merge %s; not overwriting it.", path);
+		g_key_file_free(kf);
+		g_free(chans);
+		g_free(group);
+		g_free(path);
+		return;
+	}
 	g_key_file_set_integer(kf, group, "version", VLLOGIC_CONF_VERSION);
 	g_key_file_set_double(kf, group, "threshold",
 			((struct dev_context *)sdi->priv)->cur_threshold);

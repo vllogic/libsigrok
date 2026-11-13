@@ -87,7 +87,7 @@ struct dev_context {
 	atomic_int state;		/* set from the session thread, polled by dev_close() */
 	int source_key;			/**< Unique negative session source key. */
 	GMutex rx_mutex;		/**< Guards devc->rx replacement/free. */
-	int rx_abandoned;		/**< Last teardown could not reap UB. */
+	int rx_abandoned;		/**< Last teardown could not reap URBs. */
 	int64_t stop_deadline_us;
 	int64_t start_us;
 	uint64_t last_drop_events;

@@ -535,6 +535,8 @@ static gpointer event_thread(gpointer arg)
 
 				atomic_store_explicit(&rx->fatal, 1,
 						memory_order_relaxed);
+				atomic_store_explicit(&rx->stopping, 1,
+						memory_order_release);
 				for (j = 0; j < rx->urb_count; j++) {
 					if (atomic_load_explicit(
 							&rx->urbs[j].active,
@@ -809,8 +811,10 @@ void vllogic_rx_free(struct vllogic_rx *rx)
 	}
 	for (i = 0; i < rx->buf_count; i++)
 		g_free(rx->bufs[i].data);
-	for (i = 0; i < VLLOGIC_CHUNK_COUNT; i++)
-		g_free(rx->chunks[i].data);
+	if (rx->chunks) {
+		for (i = 0; i < VLLOGIC_CHUNK_COUNT; i++)
+			g_free(rx->chunks[i].data);
+	}
 
 	if (rx->spare_chunks) {
 		g_queue_free(rx->spare_chunks);
