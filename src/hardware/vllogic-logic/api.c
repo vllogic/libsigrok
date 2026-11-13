@@ -35,8 +35,8 @@
 
 /*
  * Rates below 20 MHz keep the hardware at div=120 and decimate in the
- * parser output domain.  1 MHz is the legacy phase-A rate; 10/5/2.5 MHz are
- * the documented PC decimation tiers.
+ * parser output domain.  10/5/2.5 MHz are the documented PC decimation
+ * tiers; their factors (2/4/8) all divide the 32-sample snapshot.
  */
 struct vllogic_rate {
 	uint64_t rate;
@@ -45,27 +45,15 @@ struct vllogic_rate {
 };
 
 static const struct vllogic_rate vllogic_rates[] = {
-	{ 1000000ull,		120,	20 },
 	{ 2500000ull,		120,	8 },
 	{ 5000000ull,		120,	4 },
 	{ 10000000ull,		120,	2 },
 	{ SR_MHZ(20),		120,	1 },
-	{ SR_MHZ(24),		100,	1 },
-	{ SR_MHZ(30),		80,	1 },
 	{ SR_MHZ(40),		60,	1 },
-	{ SR_MHZ(48),		50,	1 },
-	{ SR_MHZ(60),		40,	1 },
 	{ SR_MHZ(80),		30,	1 },
-	{ SR_MHZ(96),		25,	1 },
-	{ SR_MHZ(100),		24,	1 },
-	{ SR_MHZ(120),		20,	1 },
-	{ SR_MHZ(150),		16,	1 },
+	{ SR_MHZ(160),		15,	1 },
 	{ SR_MHZ(200),		12,	1 },
-	{ SR_MHZ(240),		10,	1 },
-	{ SR_MHZ(300),		8,	1 },
 	{ SR_MHZ(400),		6,	1 },
-	{ SR_MHZ(480),		5,	1 },
-	{ SR_MHZ(600),		4,	1 },
 	{ SR_MHZ(800),		3,	1 },
 	{ SR_MHZ(1200),		2,	1 },
 };
@@ -966,7 +954,7 @@ static int config_set(uint32_t key, GVariant *data,
 
 		/*
 		 * Only exact, supported rates are accepted.  Silently clamping
-		 * (e.g. 1 MHz -> 20 MHz) hides a completely different capture.
+		 * (e.g. 1.5 MHz -> 20 MHz) hides a completely different capture.
 		 */
 		for (i = 0; i < VLLOGIC_NUM_RATES; i++) {
 			if (vllogic_rates[i].rate == rate) {

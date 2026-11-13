@@ -79,7 +79,7 @@ struct dev_context {
 	uint64_t samples_sent;
 
 	uint32_t div;			/**< Hardware ISERDES divider. */
-	uint32_t decimate;		/**< PC decimation, 1/2/4/8/20. */
+	uint32_t decimate;		/**< PC decimation, 1/2/4/8/16/32. */
 	uint8_t pwm0;
 	uint8_t pwm1;
 	double cur_threshold;		/**< nominal threshold from the LIST grid */

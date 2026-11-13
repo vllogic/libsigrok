@@ -80,9 +80,12 @@ struct uhsif_parser {
 	int snap_pos;
 	const struct vllogic_map *map;
 
-	/** PC decimation: keep one out of every @a decimate input samples. */
+	/**
+	 * PC decimation: keep one out of every @a decimate input samples.
+	 * Must divide the 32-sample snapshot (1/2/4/8/16/32), otherwise the
+	 * factor is ignored.
+	 */
 	unsigned int decimate;
-	unsigned int dec_phase;
 
 	/** Bytes to rescan before the current input, see parser_header(). */
 	uint8_t replay[UHSIF_HDR_SIZE];

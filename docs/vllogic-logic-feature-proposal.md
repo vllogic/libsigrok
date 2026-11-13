@@ -30,11 +30,11 @@
 
 | 维度 | 现状 |
 |---|---|
-| 已实现 | 20 通道任意子集、23 档采样率、PC 抽稀、单端阈值（含采集中调整）、严格带宽准入、首块头校验、1 s 启动看门狗、drop/CRC/seq/mask 统计、独立 selftest |
+| 已实现 | 20 通道任意子集、11 档采样率、PC 抽稀、单端阈值（含采集中调整）、严格带宽准入、首块头校验、1 s 启动看门狗、drop/CRC/seq/mask 统计、独立 selftest |
 | 已知缺口 | 无触发/预触发/`SR_DF_TRIGGER`；无 `LIMIT_MSEC`；无显式 `CONTINUOUS`；多设备 source key 固定 `-1`；无重插恢复；无 `PATTERN_MODE`；速率列表不随链路/通道裁剪；无结束报告行 |
 | 验证基线 L1 | `./vllogic-selftest --quiet`，不依赖硬件/libusb/libsigrok，覆盖协议向量、LUT、CRC 重同步、sink short 与 17 个解析/抽稀/限额用例 |
 | 验证基线 L2 | `--scan` + 单通道/20 通道短采集 + `--samples` 到点停止 + 阈值 GET/SET；CLI 当前仅暴露 samplerate/limit_samples/voltage_threshold/conn |
-| 验证基线 L3 | 代码注释记录的实测：60 s/30 s 采集在 375–400 MB/s 下零丢块；8ch@400 MHz、20ch@150 MHz 为已验证上限 |
+| 验证基线 L3 | 代码注释记录的实测：60 s/30 s 采集在 375–400 MB/s 下零丢块；8ch@400 MHz 为已验证上限；20ch 最高档为 160 MHz（400 MB/s，处于带宽上限，需实测确认） |
 | 长采集 | 16×256 KiB URB、256×64 KiB chunk、4 MiB/tick 预算；本次未复测，作为回归项而非既有结论 |
 | 关键事实 | 触发只能在主机侧做；设备块头没有样本索引/时间戳；逐通道阈值需多路 VBIAS，当前只有 PWM0/PWM1 两路 |
 
@@ -114,11 +114,11 @@ sigrok-cli -d vllogic-logic:conn=<B> ... --samples 10000 -o /tmp/b.sr
 **验收标准**：
 
 ```bash
-time sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 -c limit_msec=1000 -o /tmp/t.sr
-sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 -c limit_samples=500 -c limit_msec=5000 --samples 500
+time sigrok-cli -d vllogic-logic -c samplerate=2500000 -C 0 -c limit_msec=1000 -o /tmp/t.sr
+sigrok-cli -d vllogic-logic -c samplerate=2500000 -C 0 -c limit_samples=500 -c limit_msec=5000 --samples 500
 ```
 
-期望：第一条约 1 s 结束、样本数约 1e6（±5%）、日志含时间限额到点；第二条在 500 样本处停止；`limit_msec=0` 与当前完全一致。
+期望：第一条约 1 s 结束、样本数约 2.5e6（±5%）、日志含时间限额到点；第二条在 500 样本处停止；`limit_msec=0` 与当前完全一致。
 
 **可回滚性**：3 处小改，默认 0；删除 devopts 两行即恢复旧能力列表；可单独 revert。
 
@@ -144,7 +144,7 @@ sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 -c limit_samples=500 -c l
 **验收标准**：
 
 ```bash
-sigrok-cli -d vllogic-logic -c samplerate=100000000 -C 0-7 --samples 5000000 -o /tmp/r.sr 2>&1 | tee /tmp/r.log
+sigrok-cli -d vllogic-logic -c samplerate=80000000 -C 0-7 --samples 5000000 -o /tmp/r.sr 2>&1 | tee /tmp/r.log
 grep 'vllogic-report v1 ' /tmp/r.log
 ```
 
@@ -160,10 +160,10 @@ grep 'vllogic-report v1 ' /tmp/r.log
 
 | 触及点 | 建议 |
 |---|---|
-| `api.c:592-599` | `config_list(SAMPLERATE)`：`sdi` 可用时按链路静态上限 × 通道数过滤；`sdi == NULL` 返回全表 |
+| `api.c:1064-1072` | `config_list(SAMPLERATE)`：`sdi` 可用时按链路静态上限 × 通道数过滤；`sdi == NULL` 返回全表 |
 | `api.c:302-355` | `dev_open()` 记录 libusb 链路速度（SS 350 MB/s、HS 35 MB/s、未知 5 MB/s），不依赖探测 |
-| `api.c:965-982` | 拒绝信息追加“按当前链路/通道，最高可用档位为 X Hz” |
-| `api.c:47-71` | 保持 23 档表不变，只过滤，不新增/删除档位 |
+| `api.c:954-970` | 拒绝信息追加“按当前链路/通道，最高可用档位为 X Hz” |
+| `api.c:47-57` | 保持现有采样率表不变，只过滤，不新增/删除档位 |
 
 明确建议：**不做自动钳位**。钳位会静默改变用户请求，违背“精确档位、越界拒绝”的产品性格；只做列表裁剪 + 明确拒绝信息。
 
@@ -239,8 +239,8 @@ sigrok-cli -d vllogic-logic:conn=<old-bus>.<old-addr> ... --samples 10000 -o /tm
 **验收标准**：
 
 ```bash
-sigrok-cli -d vllogic-logic -c pattern_mode=Counter -c samplerate=1000000 -C 0 --samples 0 -o /tmp/counter.sr
-sigrok-cli -d vllogic-logic -c pattern_mode=Normal -c samplerate=1000000 -C 0 --samples 10000 -o /tmp/normal.sr
+sigrok-cli -d vllogic-logic -c pattern_mode=Counter -c samplerate=2500000 -C 0 --samples 0 -o /tmp/counter.sr
+sigrok-cli -d vllogic-logic -c pattern_mode=Normal -c samplerate=2500000 -C 0 --samples 10000 -o /tmp/normal.sr
 ```
 
 期望：Counter 日志含 `counter-self-test: words=N monotonic=1 rate=...`，无 `SR_DF_LOGIC`；Normal 与当前一致；`pattern_mode=WAVE` 被拒绝并列出合法值。
@@ -282,8 +282,8 @@ sigrok-cli -d vllogic-logic -c pattern_mode=Normal -c samplerate=1000000 -C 0 --
 
 ```bash
 # 1 kHz 方波接 ch0，上升沿触发，预触发 50%
-sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 -t 0=r -c capture_ratio=50 --samples 100000 -o /tmp/trig.sr
-sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 --samples 100000 -o /tmp/base.sr
+sigrok-cli -d vllogic-logic -c samplerate=2500000 -C 0 -t 0=r -c capture_ratio=50 --samples 100000 -o /tmp/trig.sr
+sigrok-cli -d vllogic-logic -c samplerate=2500000 -C 0 --samples 100000 -o /tmp/base.sr
 ```
 
 期望：`trig.sr` 含触发包，触发点约第 50000 样本（±1）；触发前至少 1 个完整周期；`base.sr` 与当前逐样本一致；两个 stage 明确报“single stage only”；ratio 越界报错；从未触发时 Ctrl-C 正常 END、无挂起、10 次重复 RSS 稳定。
@@ -313,7 +313,7 @@ sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0 --samples 100000 -o /tmp/
 **验收标准**：
 
 ```bash
-VLLOGIC_CALIB=1 sigrok-cli -d vllogic-logic -c samplerate=1000000 -C 0-3 --samples 10000 -o /tmp/cal.sr 2>&1 | grep 'calib v1'
+VLLOGIC_CALIB=1 sigrok-cli -d vllogic-logic -c samplerate=2500000 -C 0-3 --samples 10000 -o /tmp/cal.sr 2>&1 | grep 'calib v1'
 sigrok-cli -d vllogic-logic -c voltage_threshold=1.7
 ```
 
@@ -331,7 +331,7 @@ sigrok-cli -d vllogic-logic -c voltage_threshold=1.7
 | P1 `LIMIT_MSEC`/`CONTINUOUS` | 1.0 | 无 | 不迁移 `limit_samples`，只加时间限额 |
 | P6 报告行 | 1.5 | 无 | 为后续阶段提供性能基线 |
 
-**回归范围**：① L1 `./vllogic-selftest --quiet` 全通过（含新增用例）；② L2 `--scan`、单通道 1 MHz、20 通道 100 MHz、阈值 GET/SET、`--samples` 到点；③ L3 8ch@400 MHz、20ch@150 MHz 各 60 s，质量计数不得新增非零；④ 停止路径 Ctrl-C/`--samples`/`--time`/`dev_close()`，END 只发一次；⑤ 1ch@1 MHz 连续 10 分钟，RSS 增长 <10%，无线程/fd 泄漏；⑥ scan/定长/任意子集/严格准入拒绝四类 CLI。
+**回归范围**：① L1 `./vllogic-selftest --quiet` 全通过（含新增用例）；② L2 `--scan`、单通道 2.5 MHz、20 通道 160 MHz、阈值 GET/SET、`--samples` 到点；③ L3 8ch@400 MHz、20ch@160 MHz 各 60 s，质量计数不得新增非零；④ 停止路径 Ctrl-C/`--samples`/`--time`/`dev_close()`，END 只发一次；⑤ 1ch@2.5 MHz 连续 10 分钟，RSS 增长 <10%，无线程/fd 泄漏；⑥ scan/定长/任意子集/严格准入拒绝四类 CLI。
 
 **阶段闸门**：L1 全绿；L2/L3 无质量计数退化；同配置单设备输出与改动前逐样本一致；报告行可解析；任一失败即回滚对应 commit，不进入 Phase 2。
 
@@ -374,9 +374,9 @@ sigrok-cli -d vllogic-logic -c voltage_threshold=1.7
 | 层级 | 内容 | 频率 | 失败处理 |
 |---|---|---|---|
 | L0 selftest | 纯 C、无硬件：协议、LUT、CRC、抽稀、限额、触发匹配、拟合、校准表 | 每次提交 | 阻断合并 |
-| L1 单通道真机 | 1 MHz/100 MHz，1 通道，短采集，阈值 | 每次提交 | 阻断合并 |
-| L2 多通道 | 8ch@400 MHz、20ch@150 MHz，60 s | 每阶段 | 阻断进入下一阶段 |
-| L3 长采集 | 1ch@1 MHz 10 分钟；可选 20ch@100 MHz 60 s | 每阶段 | 查泄漏/丢块 |
+| L1 单通道真机 | 2.5 MHz/160 MHz，1 通道，短采集，阈值 | 每次提交 | 阻断合并 |
+| L2 多通道 | 8ch@400 MHz、20ch@160 MHz，60 s | 每阶段 | 阻断进入下一阶段 |
+| L3 长采集 | 1ch@2.5 MHz 10 分钟；可选 20ch@80 MHz 60 s | 每阶段 | 查泄漏/丢块 |
 | 停止路径 | Ctrl-C、`--samples`、`--time`、`dev_close()`、拔线 | 每项 | 阻断发布 |
 | 兼容性 | 旧命令不带新键；旧 `.sr` 可读；`VLLOGIC_STRICT=0/1` | 每阶段 | 阻断发布 |
 

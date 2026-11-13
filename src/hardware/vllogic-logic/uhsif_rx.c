@@ -118,17 +118,12 @@ static void emit_snapshot(struct uhsif_parser *p)
 
 	/*
 	 * PC decimation happens in the output domain: keep input sample 0,
-	 * dec, 2*dec, ... across snapshot boundaries (the phase is carried in
-	 * the parser, so factors that do not divide 32 work as well).
+	 * dec, 2*dec, ...  Only factors that divide the 32-sample snapshot
+	 * (1/2/4/8/16/32) are supported, so the phase always restarts at 0
+	 * and no cross-snapshot state is needed.
 	 * limit_samples counts these output samples.
 	 */
-	for (s = 0; s < 32; s++) {
-		if (p->dec_phase != 0) {
-			p->dec_phase++;
-			if (p->dec_phase >= dec)
-				p->dec_phase = 0;
-			continue;
-		}
+	for (s = 0; s < 32; s += (int)dec) {
 		if (p->limit_samples != 0 &&
 		    p->samples_out + (uint64_t)emitted >= p->limit_samples) {
 			p->limit_reached = 1;
@@ -141,9 +136,6 @@ static void emit_snapshot(struct uhsif_parser *p)
 				o[j] = lbytes[j][s];
 		}
 		emitted++;
-		p->dec_phase = 1;
-		if (p->dec_phase >= dec)
-			p->dec_phase = 0;
 	}
 
 	if (emitted > 0 && p->sink && p->sink->write) {
@@ -377,7 +369,6 @@ void uhsif_parser_finish(struct uhsif_parser *p)
 	p->hdr_len = 0;
 	p->pay_rem = 0;
 	p->replay_len = 0;
-	p->dec_phase = 0;
 	p->drop_active = 0;
 	p->state = 0;
 
@@ -396,6 +387,9 @@ void uhsif_parser_init(struct uhsif_parser *p, const struct vllogic_map *map,
 	p->map = map;
 	p->limit_samples = limit_samples;
 	p->decimate = decimate ? decimate : 1;
+	/* Only factors that divide the 32-sample snapshot are supported. */
+	if (p->decimate > 32 || (32u % p->decimate) != 0)
+		p->decimate = 1;
 	p->sink = sink;
 	p->sink_user = sink_user;
 
@@ -1289,14 +1283,14 @@ int uhsif_selftest(int verbose)
 		{ "unit=3 20ch 4092/blk", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
 					11, 12, 13, 14, 15, 16, 17, 18, 19 }, 20,
 		  0, 1, 0, 0, 4092, 1 },
-		/* PC decimation, including a factor that does not divide 32. */
+		/* PC decimation; factors divide the 32-sample snapshot. */
 		{ "unit=3 20ch decimate 2", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
 					11, 12, 13, 14, 15, 16, 17, 18, 19 }, 20,
 		  0, 1, 0, 0, 0, 2 },
 		{ "unit=3 20ch decimate 8", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
 					11, 12, 13, 14, 15, 16, 17, 18, 19 }, 20,
 		  0, 1, 0, 0, 0, 8 },
-		{ "unit=1 decimate 20 lim 100", { 0 }, 1, 0, 0, 0, 100, 0, 20 },
+		{ "unit=1 decimate 32 lim 100", { 0 }, 1, 0, 0, 0, 100, 0, 32 },
 	};
 	size_t i;
 	int ok = 1, ret;

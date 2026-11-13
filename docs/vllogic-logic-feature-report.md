@@ -21,9 +21,9 @@
 | 5 | 逻辑→物理通道映射 | 自动 | `protocol.h:56-60`、`protocol.c:149-191` | 前 16 路两两交换（`1,0,3,2,...`），16..19 直通；映射后 `unitsize = 最高逻辑通道/8+1` |
 | 6 | 通道 LUT 下发 | 自动 | `protocol.c:93-138`、`vllogic_usb.c:1197-1202` | 32 项 5-bit 升序环；FPGA 复位为全 0，LUT 必须显式重建，否则快照会重复通道 0 |
 | 7 | 任意通道子集 | 只使能需要的通道 | `api.c:797-830`、`protocol.c:162-188` | 只把使能通道写入 mask，线上只传这些 lane；不是“连续前缀”模式，通道可以跳选（如 0、5、12） |
-| 8 | 采样率 GET/SET/LIST | `-c samplerate=<Hz>` | `api.c:47-71`、`api.c:507-532`、`api.c:592-599` | 23 档：1M/2.5M/5M/10M/20M/24M/30M/40M/48M/60M/80M/96M/100M/120M/150M/200M/240M/300M/400M/480M/600M/800M/1200M；只接受精确档位，不静默钳位（`api.c:512-526`） |
-| 9 | 硬件分频 | 随采样率自动 | `api.c:47-71`、`vllogic_usb.c:1204` | 时钟 2.4 GHz，`div` 2..120（`protocol.h:63-65`）；≥20 MHz 用 div=120..2 |
-| 10 | PC 侧抽稀 | 随采样率自动 | `api.c:47-71`、`uhsif_rx.c:119-147`、`uhsif_rx.c:398` | <20 MHz 固定 div=120（20 MHz 线上），PC 按 1/2/4/8/20 抽稀到 10/5/2.5/1 MHz；抽稀相位跨快照保持 |
+| 8 | 采样率 GET/SET/LIST | `-c samplerate=<Hz>` | `api.c:47-57`、`api.c:488-518`、`api.c:1064-1072` | 11 档：2.5M/5M/10M/20M/40M/80M/160M/200M/400M/800M/1200M；只接受精确档位，不静默钳位（`api.c:954-970`） |
+| 9 | 硬件分频 | 随采样率自动 | `api.c:47-57`、`vllogic_usb.c:1204` | 时钟 2.4 GHz，`div` 2..120（`protocol.h:63-65`）；≥20 MHz 用 div=120..2 |
+| 10 | PC 侧抽稀 | 随采样率自动 | `api.c:47-57`、`uhsif_rx.c:119-140`、`uhsif_rx.c:380-392` | <20 MHz 固定 div=120（20 MHz 线上），PC 按 2/4/8 抽稀到 10/5/2.5 MHz；因子必须整除 32 样本快照，因此无需跨快照相位 |
 | 11 | 每速率通道上限 | 自动拒绝 | `api.c:77-89`、`api.c:816-825` | >800M:2ch、>400M:4ch、>200M:8ch、>160M:16ch、≤160M:20ch；超限 `SR_ERR_ARG` |
 | 12 | `LIMIT_SAMPLES` | `-c limit_samples=N` 或 CLI `--samples N` | `api.c:101`、`api.c:534-538`、`uhsif_rx.c:132-136` | 计数的是抽稀后的输出样本；0=不限；解析器到点即停并 flush（`uhsif_rx.c:166-176`），会话侧再按已发送/已生产双条件收尾（`api.c:759-763`） |
 | 13 | `VOLTAGE_THRESHOLD` GET/SET/LIST | `-c voltage_threshold=<V>` | `api.c:102`、`api.c:539-583`、`api.c:600-601` | 单端阈值：GET 返回 `(vth,vth)`（`api.c:475-480`），SET 取 low/high 平均；范围 -2.5..+5.0 V、步进 0.1；越界拒绝而非钳位（`api.c:548-557`） |
@@ -46,9 +46,10 @@
 
 | 输出速率 | 硬件 `div` | PC 抽稀 | 线上速率 | 备注 |
 |---|---:|---:|---:|---|
-| 1 / 2.5 / 5 / 10 MHz | 120 | 20 / 8 / 4 / 2 | 20 MHz | 复用同一硬件档，靠抽稀降速 |
+| 2.5 / 5 / 10 MHz | 120 | 8 / 4 / 2 | 20 MHz | 复用同一硬件档，靠抽稀降速 |
 | 20 MHz | 120 | 1 | 20 MHz | 抽稀边界 |
-| 24..1200 MHz | 100..2 | 1 | 等于输出速率 | 逐档独立 div，见 `api.c:53-70` |
+| 40 / 80 / 160 MHz | 60 / 30 / 15 | 1 | 等于输出速率 | 逐档独立 div |
+| 200 / 400 / 800 / 1200 MHz | 12 / 6 / 3 / 2 | 1 | 等于输出速率 | 逐档独立 div，见 `api.c:47-57` |
 
 ### 1.3 统计字段口径
 
@@ -75,7 +76,7 @@
 |---|---|---|---|
 | 枚举设备 | `sigrok-cli -d vllogic-logic --scan` | 列出 `VLLogic Logic20`，带 `conn`/serial | ✅ `api.c:185-295` |
 | 按端口选择 | `-d vllogic-logic:conn=<bus>.<addr>` | 只打开指定设备 | ✅ `api.c:199-215` |
-| 定长采集 | `-c samplerate=100000000 -C 0-7 --samples 100000` | 8 通道、100 MS/s、10 万样本 | ✅ `api.c:507-532`、`api.c:797-830` |
+| 定长采集 | `-c samplerate=80000000 -C 0-7 --samples 100000` | 8 通道、80 MS/s、10 万样本 | ✅ `api.c:488-518`、`api.c:797-830` |
 | 任意通道子集 | `-C 0,5,12` | 只传 3 条 lane，unitsize=2 | ✅ `protocol.c:162-188` |
 | 阈值 | `-c voltage_threshold=<V>` | 单端阈值，越界报错 | ✅ `api.c:539-583`（元组 CLI 写法随 sigrok-cli 版本） |
 | 样本限额 | `--samples N` / `-c limit_samples=N` | 到点自动 STOP 并收尾 | ✅ `api.c:759-763`、`api.c:1045-1059` |
@@ -92,7 +93,7 @@
 
 | 能力 | sipeed 结论 | sipeed 证据 | vllogic 结论 | vllogic 证据/说明 |
 |---|---|---|---|---|
-| 采样率 GET/SET/LIST | ✅ 有，且按“链路×通道”动态裁剪 | `src/hardware/sipeed-slogic-analyzer/api.c:41`、`api.c:307-317`、`api.c:411-420`、`slogic/slogic_data.c:92-152` | ✅ 有，但固定 23 档、不随链路裁剪 | `src/hardware/vllogic-logic/api.c:47-71`、`api.c:592-599` |
+| 采样率 GET/SET/LIST | ✅ 有，且按“链路×通道”动态裁剪 | `src/hardware/sipeed-slogic-analyzer/api.c:41`、`api.c:307-317`、`api.c:411-420`、`slogic/slogic_data.c:92-152` | ✅ 有，但固定 11 档、不随链路裁剪 | `src/hardware/vllogic-logic/api.c:47-57`、`api.c:1064-1072` |
 | 通道数与通道组 | ✅ 有 `SR_CONF_NUM_LOGIC_CHANNELS` + `LA` 组 | `api.c:45`、`api.c:191-199`、`api.c:273-275`、`api.c:421-428` | ◐ 固定 20 通道、无组、无 NUM 键 | `api.c:264-271`、`api.c:99-104` |
 | 动态通道使能 | ✅ 有：使能变化自动选最小覆盖档 | `api.c:368-398`、`api.c:318-335` | ✅ 有：任意子集直接改 mask，比“前缀档位”更灵活 | `api.c:797-830`、`protocol.c:162-188` |
 | 触发 `TRIGGER_MATCH` | ✅ 有：zero/one/rising/falling/edge | `api.c:42`、`api.c:48-51`、`api.c:433-435` | ❌ 无 | `api.c:99-104` 无 trigger 键 |
@@ -178,7 +179,7 @@
 | 链路探测 + 严格准入 | 高：采集前就拒绝必然丢数的配置 | `api.c:844-983`、`vllogic_usb.c:1102-1180` | sipeed 是“先跑，跑不动再 abort/重配” |
 | 采集中调阈值 | 高：扫阈值不用反复重启采集 | `api.c:563-579` | sipeed 只在下次 configure 生效 |
 | 任意通道子集 | 中高：只传需要的 lane，省带宽 | `protocol.c:162-188`、`api.c:797-830` | sipeed 按最高使能通道选“连续前缀档”，会多传中间通道 |
-| PC 抽稀低速率档 | 中：1/2.5/5/10 MHz 无需改硬件分频 | `api.c:47-71`、`uhsif_rx.c:119-147` | sipeed 依赖其固件档位 |
+| PC 抽稀低速率档 | 中：2.5/5/10 MHz 无需改硬件分频 | `api.c:47-57`、`uhsif_rx.c:119-140` | sipeed 依赖其固件档位 |
 | 首块头校验 + 启动看门狗 | 中高：配置没生效时立刻失败，不产出伪数据 | `vllogic_usb.c:263-285`、`api.c:764-771` | sipeed 主要靠速率/停滞判断 |
 | 13+5 项驱动内统计 | 中：现场排障可定位到 CRC/seq/mask/sink | `uhsif_rx.h:41-55` | sipeed 只有聚合 report 行 |
 | 无硬件自测 | 中：CI 可跑，不需要设备 | `selftest.c:43`、`uhsif_rx.c:1267` | sipeed 未见等价独立自测入口 |
@@ -299,9 +300,9 @@
 | A5 | 逻辑→物理通道排列 | `libsigrok_vllogic/src/hardware/vllogic-logic/protocol.h:58` |
 | A6 | 通道映射构建 | `libsigrok_vllogic/src/hardware/vllogic-logic/protocol.c:149` |
 | A7 | 32 项 LUT 构建 | `libsigrok_vllogic/src/hardware/vllogic-logic/protocol.c:93` |
-| A8 | 23 档采样率表 | `libsigrok_vllogic/src/hardware/vllogic-logic/api.c:47` |
+| A8 | 采样率表（11 档） | `libsigrok_vllogic/src/hardware/vllogic-logic/api.c:47` |
 | A9 | 每速率通道上限 | `libsigrok_vllogic/src/hardware/vllogic-logic/api.c:77` |
-| A10 | PC 抽稀与相位 | `libsigrok_vllogic/src/hardware/vllogic-logic/uhsif_rx.c:119` |
+| A10 | PC 抽稀（32 的约数因子） | `libsigrok_vllogic/src/hardware/vllogic-logic/uhsif_rx.c:119` |
 | A11 | `LIMIT_SAMPLES` 配置 | `libsigrok_vllogic/src/hardware/vllogic-logic/api.c:534` |
 | A12 | 解析器样本限额 | `libsigrok_vllogic/src/hardware/vllogic-logic/uhsif_rx.c:132` |
 | A13 | 阈值 SET/范围校验 | `libsigrok_vllogic/src/hardware/vllogic-logic/api.c:539` |
