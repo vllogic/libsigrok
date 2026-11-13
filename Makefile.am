@@ -778,13 +778,14 @@ vllogic_selftest_mt_SOURCES = \
 vllogic_selftest_mt_CFLAGS = $(LIBSIGROK_CFLAGS)
 vllogic_selftest_mt_LDADD = $(SR_EXTRA_LIBS) $(LIBSIGROK_LIBS)
 # selftest.c #includes these .c files; make the dependency explicit so a
-# change to the parser recompiles the test binary.
-vllogic-selftest$(EXEEXT): $(srcdir)/src/hardware/vllogic-logic/protocol.c \
+# change to the parser recompiles the test binary. Use the automake
+# _DEPENDENCIES variable: an explicit target rule here would override the
+# generated link recipe and leave the tests unbuilt.
+vllogic_selftest_DEPENDENCIES = \
+		$(srcdir)/src/hardware/vllogic-logic/protocol.c \
 		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.c \
 		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.h
-vllogic-selftest-mt$(EXEEXT): $(srcdir)/src/hardware/vllogic-logic/protocol.c \
-		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.c \
-		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.h
+vllogic_selftest_mt_DEPENDENCIES = $(vllogic_selftest_DEPENDENCIES)
 endif
 if HW_YOKOGAWA_DLM
 src_libdrivers_la_SOURCES += \
