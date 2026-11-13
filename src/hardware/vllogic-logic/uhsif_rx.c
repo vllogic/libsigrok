@@ -539,6 +539,15 @@ static void workers_accept(struct uhsif_parser *p)
 	if (!w->fill_job) {
 		for (;;) {
 			workers_drain(p);
+			/*
+			 * workers_drain() may hit limit_samples and leave
+			 * the head job marked JOB_DONE.  Without this check
+			 * the loop below would see that job forever (it is
+			 * the next free slot once all jobs are done) and
+			 * spin at 100% CPU.
+			 */
+			if (p->limit_reached)
+				return;
 			g_mutex_lock(&w->lock);
 			job = &w->jobs[w->next_seq % UHSIF_JOB_COUNT];
 			if (job->state == JOB_FREE) {
