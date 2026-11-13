@@ -1191,18 +1191,20 @@ static int config_list(uint32_t key, GVariant **data,
 static void vllogic_begin_stop(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
+	struct vllogic_rx *rx;
 
 	if (!devc || devc->state != VLLOGIC_CAPTURING)
 		return;
 
-	/*
-	 * STOP first, then stop resubmitting: a cancelled URB still carries
-	 * the bytes received before the stop, and those belong to the
-	 * capture window.
-	 */
-	if (devc->rx) {
-		(void)vllogic_send_simple(devc->rx, UHSIF_CMD_STOP, 0);
-		vllogic_rx_set_stopping(devc->rx);
+	g_mutex_lock(&devc->rx_mutex);
+	rx = devc->rx;
+	if (rx)
+		vllogic_rx_ref(rx);
+	g_mutex_unlock(&devc->rx_mutex);
+	if (rx) {
+		(void)vllogic_send_simple(rx, UHSIF_CMD_STOP, 0);
+		vllogic_rx_set_stopping(rx);
+		vllogic_rx_free(rx);
 	}
 
 	atomic_store_explicit(&devc->state, VLLOGIC_STOPPING, memory_order_relaxed);
@@ -1311,15 +1313,25 @@ static int receive_data(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi = cb_data;
 	struct dev_context *devc = sdi->priv;
+	struct vllogic_rx *rx;
+	int ret = TRUE;
 
 	(void)fd;
 	(void)revents;
 
-	if (!devc || !devc->rx)
+	if (!devc)
 		return FALSE;
 
-	if (devc->rx) {
-		uint64_t ev = vllogic_rx_drop_events(devc->rx);
+	g_mutex_lock(&devc->rx_mutex);
+	rx = devc->rx;
+	if (rx)
+		vllogic_rx_ref(rx);
+	g_mutex_unlock(&devc->rx_mutex);
+	if (!rx)
+		return FALSE;
+
+	{
+		uint64_t ev = vllogic_rx_drop_events(rx);
 
 		if (ev != devc->last_drop_events) {
 			devc->last_drop_events = ev;
@@ -1334,41 +1346,45 @@ static int receive_data(int fd, int revents, void *cb_data)
 
 		if (atomic_load_explicit(&devc->state,
 				memory_order_relaxed) == VLLOGIC_CAPTURING &&
-		    vllogic_rx_first_block_bad(devc->rx, msg, sizeof(msg))) {
+		    vllogic_rx_first_block_bad(rx, msg, sizeof(msg))) {
 			sr_err("%s", msg);
 			vllogic_begin_stop(sdi);
-			return TRUE;
+			goto out;
 		}
 	}
 
-	(void)vllogic_drain(sdi, devc->rx, VLLOGIC_SEND_BUDGET);
+	(void)vllogic_drain(sdi, rx, VLLOGIC_SEND_BUDGET);
 
 	if (atomic_load_explicit(&devc->state, memory_order_relaxed) == VLLOGIC_CAPTURING) {
-		if (vllogic_rx_fatal(devc->rx)) {
+		if (vllogic_rx_fatal(rx)) {
 			sr_err("USB transfer failed, stopping the capture.");
 			vllogic_begin_stop(sdi);
 		} else if (devc->limit_samples != 0 &&
 			   (devc->samples_sent >= devc->limit_samples ||
-			    vllogic_rx_samples_produced(devc->rx) >=
+			    vllogic_rx_samples_produced(rx) >=
 			    devc->limit_samples)) {
 			vllogic_begin_stop(sdi);
 		} else if (devc->start_us != 0 &&
 			   g_get_monotonic_time() - devc->start_us >=
 			   (int64_t)G_TIME_SPAN_SECOND &&
-			   vllogic_rx_data_blocks(devc->rx) == 0) {
+			   vllogic_rx_data_blocks(rx) == 0) {
 			sr_err("No CRC-valid block within 1000 ms of START; "
 				"the device is not streaming.");
 			vllogic_begin_stop(sdi);
 		}
-	} else if (atomic_load_explicit(&devc->state, memory_order_relaxed) == VLLOGIC_STOPPING) {
+	} else if (atomic_load_explicit(&devc->state,
+			memory_order_relaxed) == VLLOGIC_STOPPING) {
 		if (g_get_monotonic_time() >= devc->stop_deadline_us) {
 			vllogic_finish(sdi);
 			/* Removes the timer source. */
-			return FALSE;
+			ret = FALSE;
+			goto out;
 		}
 	}
 
-	return TRUE;
+out:
+	vllogic_rx_free(rx);
+	return ret;
 }
 
 static int dev_acquisition_start(const struct sr_dev_inst *sdi)

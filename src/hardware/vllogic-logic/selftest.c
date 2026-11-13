@@ -34,7 +34,9 @@
  * copy instead of the real thing.
  */
 
+#if !defined(UHSIF_SELFTEST_MT)
 #define UHSIF_NO_THREADS 1
+#endif
 
 #include <stdio.h>
 #include <string.h>

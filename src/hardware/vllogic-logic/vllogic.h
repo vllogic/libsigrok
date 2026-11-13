@@ -101,6 +101,7 @@ struct dev_context {
 struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 		const struct vllogic_map *map, uint64_t limit_samples);
 void vllogic_rx_free(struct vllogic_rx *rx);
+void vllogic_rx_ref(struct vllogic_rx *rx);
 int vllogic_rx_start(struct vllogic_rx *rx);
 void vllogic_rx_set_stopping(struct vllogic_rx *rx);
 void vllogic_rx_stop(struct vllogic_rx *rx);
@@ -115,7 +116,6 @@ uint64_t vllogic_rx_samples_produced(const struct vllogic_rx *rx);
 uint64_t vllogic_rx_drop_events(const struct vllogic_rx *rx);
 int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 		uint64_t *bps);
-uint64_t vllogic_rx_blocks(const struct vllogic_rx *rx);
 uint64_t vllogic_rx_data_blocks(const struct vllogic_rx *rx);
 int vllogic_rx_abandoned(const struct vllogic_rx *rx);
 int vllogic_rx_first_block_bad(const struct vllogic_rx *rx, char *buf,

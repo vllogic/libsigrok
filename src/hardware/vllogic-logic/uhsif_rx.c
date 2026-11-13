@@ -609,6 +609,13 @@ static void workers_finish(struct uhsif_parser *p)
 		g_mutex_unlock(&w->lock);
 	}
 
+	if (p->limit_samples != 0 &&
+	    p->samples_out + p->out_len / p->map->unitsize >=
+		    p->limit_samples) {
+		p->limit_reached = 1;
+		parser_limit_done(p);
+	}
+
 	g_mutex_lock(&w->lock);
 	w->stop = 1;
 	g_cond_broadcast(&w->cond);
@@ -1165,7 +1172,7 @@ struct st_case {
  * cross-block behaviour.
  */
 static int st_run_case(const struct st_case *tc, int verbose,
-		unsigned int batch, int use_avx2)
+		unsigned int batch, int use_avx2, unsigned int workers)
 {
 	uint8_t *stream = NULL;
 	uint8_t *expect = NULL;
@@ -1272,6 +1279,8 @@ static int st_run_case(const struct st_case *tc, int verbose,
 	uhsif_parser_init(&parser, &map, tc->limit, dec, &st_sink, &ctx);
 	uhsif_parser_set_batch(&parser, batch);
 	parser.use_avx2 = use_avx2;
+	if (workers >= 2)
+		(void)uhsif_parser_set_workers(&parser, workers, 4);
 
 	while (off < stream_len) {
 		size_t n = chunks[ci++ % nchunks];
@@ -1975,13 +1984,19 @@ int uhsif_selftest(int verbose)
 		ok = 0;
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		st_xs = 0x123456789ABCDEFull;
-		ret = st_run_case(&cases[i], verbose, 0, 0);
+		ret = st_run_case(&cases[i], verbose, 0, 0, 0);
 		if (ret != 0)
 			ok = 0;
 		/* Exercise the coalescing and AVX2 paths (AVX2 falls back). */
-		ret = st_run_case(&cases[i], verbose, 256, 1);
+		ret = st_run_case(&cases[i], verbose, 256, 1, 0);
 		if (ret != 0)
 			ok = 0;
+#if !defined(UHSIF_NO_THREADS)
+		/* Exercise the worker path, including limit handling. */
+		ret = st_run_case(&cases[i], verbose, 256, 1, 2);
+		if (ret != 0)
+			ok = 0;
+#endif
 	}
 
 	if (verbose)

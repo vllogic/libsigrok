@@ -763,15 +763,26 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/vllogic-logic/vllogic_usb.c \
 	src/hardware/vllogic-logic/api.c
 
-noinst_PROGRAMS = vllogic-selftest
+noinst_PROGRAMS = vllogic-selftest vllogic-selftest-mt
 vllogic_selftest_SOURCES = \
 	src/hardware/vllogic-logic/selftest.c \
 	src/hardware/vllogic-logic/protocol.h \
 	src/hardware/vllogic-logic/uhsif_rx.h
 vllogic_selftest_LDADD = $(SR_EXTRA_LIBS)
+# Worker-path variant: selftest_mt.c includes selftest.c without
+# UHSIF_NO_THREADS and links the GLib threading layer.
+vllogic_selftest_mt_SOURCES = \
+	src/hardware/vllogic-logic/selftest_mt.c \
+	src/hardware/vllogic-logic/protocol.h \
+	src/hardware/vllogic-logic/uhsif_rx.h
+vllogic_selftest_mt_CFLAGS = $(LIBSIGROK_CFLAGS)
+vllogic_selftest_mt_LDADD = $(SR_EXTRA_LIBS) $(LIBSIGROK_LIBS)
 # selftest.c #includes these .c files; make the dependency explicit so a
 # change to the parser recompiles the test binary.
 vllogic-selftest$(EXEEXT): $(srcdir)/src/hardware/vllogic-logic/protocol.c \
+		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.c \
+		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.h
+vllogic-selftest-mt$(EXEEXT): $(srcdir)/src/hardware/vllogic-logic/protocol.c \
 		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.c \
 		$(srcdir)/src/hardware/vllogic-logic/uhsif_rx.h
 endif

@@ -120,6 +120,7 @@ struct vllogic_rx {
 	atomic_uint_fast64_t data_blocks_seen;	/* CRC-valid data blocks */
 	atomic_int first_block_bad;
 	atomic_int abandoned;		/* teardown timed out, do not free */
+	atomic_int refs;		/* owners + in-flight users */
 	unsigned int expected_div;
 	uint32_t expected_mask;
 	int first_checked;
@@ -237,7 +238,8 @@ static void rx_sink_flush(void *user)
 		return;
 	rx->parser_cur = NULL;
 	if (c->len == 0) {
-		(void)ptr_push(&rx->chunk_free, c);
+		/* Parser-owned spare queue: chunk_free is session-produced. */
+		g_queue_push_tail(rx->spare_chunks, c);
 		return;
 	}
 	if (ptr_push(&rx->chunk_filled, c) == 0)
@@ -614,7 +616,8 @@ static gpointer parser_thread(gpointer arg)
 		}
 	}
 
-	uhsif_parser_finish(&rx->parser);
+	if (rx->parser.map)
+		uhsif_parser_finish(&rx->parser);
 
 	return NULL;
 }
@@ -635,6 +638,7 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 		return NULL;
 
 	rx = g_malloc0(sizeof(*rx));
+	atomic_init(&rx->refs, 1);
 	rx->hdl = usb->devhdl;
 	rx->usb_ctx = devc->usb_ctx;
 	rx->urb_count = VLLOGIC_URB_COUNT;
@@ -670,6 +674,7 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 		rx->urbs[i].xfer = libusb_alloc_transfer(0);
 		if (!rx->urbs[i].xfer) {
 			sr_err("Failed to allocate USB transfer %u.", i);
+			vllogic_rx_free(rx);
 			return NULL;
 		}
 		atomic_init(&rx->urbs[i].active, 0);
@@ -764,11 +769,21 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 	return rx;
 }
 
+void vllogic_rx_ref(struct vllogic_rx *rx)
+{
+	if (rx)
+		atomic_fetch_add_explicit(&rx->refs, 1,
+				memory_order_relaxed);
+}
+
 void vllogic_rx_free(struct vllogic_rx *rx)
 {
 	unsigned int i;
 
 	if (!rx)
+		return;
+	if (atomic_fetch_sub_explicit(&rx->refs, 1,
+			memory_order_acq_rel) != 1)
 		return;
 
 	vllogic_rx_stop(rx);
@@ -1033,14 +1048,6 @@ uint64_t vllogic_rx_samples_produced(const struct vllogic_rx *rx)
 	return bytes / (uint64_t)rx->parser.map->unitsize;
 }
 
-/** CRC-valid blocks parsed so far (for the start-up watchdog). */
-uint64_t vllogic_rx_blocks(const struct vllogic_rx *rx)
-{
-	if (!rx)
-		return 0;
-
-	return atomic_load_explicit(&rx->blocks_seen, memory_order_relaxed);
-}
 
 /** CRC-valid data blocks (ACK-only blocks excluded), for the watchdog. */
 uint64_t vllogic_rx_data_blocks(const struct vllogic_rx *rx)
