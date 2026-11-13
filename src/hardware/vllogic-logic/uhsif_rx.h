@@ -99,6 +99,9 @@ struct uhsif_parser {
 	/** Allow the AVX2 multi-lane expander when the CPU supports it. */
 	int use_avx2;
 
+	/** Optional expansion workers; NULL means the parser thread expands. */
+	void *workers;
+
 	/**
 	 * Output coalescing: expanded snapshots are accumulated here and
 	 * handed to the sink in larger blocks.  0 = write each snapshot
@@ -145,6 +148,14 @@ void uhsif_parser_init(struct uhsif_parser *p, const struct vllogic_map *map,
  * UHSIF_OUT_BATCH_MAX.
  */
 void uhsif_parser_set_batch(struct uhsif_parser *p, unsigned int bytes);
+/**
+ * Start expansion workers.  workers < 2 keeps everything on the parser
+ * thread.  @a job_snaps limits how many snapshots one worker job contains
+ * (smaller values reduce low-rate latency).  Returns 0 on success, -1 if
+ * the workers could not be created.
+ */
+int uhsif_parser_set_workers(struct uhsif_parser *p, unsigned int workers,
+		unsigned int job_snaps);
 void uhsif_parser_feed(struct uhsif_parser *p, const uint8_t *data, size_t len);
 /**
  * Enable dropping the leading (pre-START pipeline) payload word.

@@ -24,6 +24,10 @@
 
 #include "uhsif_rx.h"
 
+#if !defined(UHSIF_NO_THREADS)
+#include <glib.h>
+#endif
+
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #define UHSIF_HAVE_AVX2 1
@@ -274,11 +278,19 @@ static void emit_single_snapshot(struct uhsif_parser *p)
 	}
 }
 
-static void emit_snapshot(struct uhsif_parser *p)
+/**
+ * Expand one snapshot into wire-order sample bytes.  Shared by the parser
+ * thread (single-threaded mode) and the expansion workers.  No limit or
+ * sink handling here; the caller applies those to the returned count.
+ *
+ * out[] must provide room for 32 * unit + 4 bytes (the sparse unit=3 path
+ * uses an overlapping 32-bit store).
+ */
+static size_t expand_snapshot_to(struct uhsif_parser *p, const uint32_t *words,
+		uint8_t *out)
 {
 	uint64_t lanes[3][4];
 	uint8_t lbytes[3][32];
-	uint8_t out[3 * 32 + 4];
 	const struct vllogic_map *map = p->map;
 	unsigned int dec = p->decimate ? p->decimate : 1;
 	int nchan = map->nchan;
@@ -287,22 +299,37 @@ static void emit_snapshot(struct uhsif_parser *p)
 	int sparse3 = (unit == 3 && map->lane_used == 4);
 	int sparse2 = (unit == 2 && map->lane_used == 2);
 	uint64_t m;
-	uint64_t pending;
 
-	if (p->limit_reached)
-		return;
+	if (nchan == 1) {
+		uint32_t w = words[0];
+		int logical = map->phys2log[map->phys_list[0]];
+		int lane = logical >> 3;
+		int bit = logical & 7;
+		size_t nout = (size_t)(32 / (int)dec);
 
-	pending = (uint64_t)(p->out_len / (unsigned int)unit);
+		memset(out, 0, nout * (size_t)unit);
+		for (s = 0; s < 32; s += (int)dec) {
+			if (unit == 1)
+				out[emitted] =
+					(uint8_t)((((w >> s) & 1u) << bit));
+			else
+				out[(size_t)emitted * (size_t)unit +
+				    (size_t)lane] =
+					(uint8_t)((((w >> s) & 1u) << bit));
+			emitted++;
+		}
+		return (size_t)emitted;
+	}
 
 #if defined(UHSIF_HAVE_AVX2)
 	if (p->use_avx2 && parser_avx2_available()) {
-		expand_avx2(p->snap, map, unit, lbytes);
+		expand_avx2(words, map, unit, lbytes);
 	} else
 #endif
 	{
 		memset(lanes, 0, sizeof(lanes));
 		for (g = 0; g < nchan; g++) {
-			uint32_t w = p->snap[g];
+			uint32_t w = words[g];
 			int logical = map->phys2log[map->phys_list[g]];
 
 			lane = logical >> 3;
@@ -325,76 +352,289 @@ static void emit_snapshot(struct uhsif_parser *p)
 		}
 	}
 
-	/*
-	 * PC decimation happens in the output domain: keep input sample 0,
-	 * dec, 2*dec, ...  Only factors that divide the 32-sample snapshot
-	 * (1/2/4/8/16/32) are supported, so the phase always restarts at 0
-	 * and no cross-snapshot state is needed.
-	 * limit_samples counts these output samples.
-	 */
-	if (p->limit_samples == 0) {
-		if (sparse3) {
-			for (s = 0; s < 32; s += (int)dec) {
-				uint8_t *o = out +
-					(size_t)emitted * (size_t)unit;
-				uint32_t v = (uint32_t)lbytes[2][s] << 16;
+	if (sparse3) {
+		for (s = 0; s < 32; s += (int)dec) {
+			uint8_t *o = out + (size_t)emitted * (size_t)unit;
+			uint32_t v = (uint32_t)lbytes[2][s] << 16;
 
-				/*
-				 * One unaligned 32-bit store instead of three
-				 * byte stores.  The 4th byte overlaps the next
-				 * sample and is overwritten there; out[] has 4
-				 * spare bytes for the final sample.
-				 */
-				memcpy(o, &v, 4);
-				emitted++;
-			}
-		} else if (sparse2) {
-			for (s = 0; s < 32; s += (int)dec) {
-				uint8_t *o = out +
-					(size_t)emitted * (size_t)unit;
-				uint16_t v = (uint16_t)lbytes[1][s] << 8;
+			memcpy(o, &v, 4);
+			emitted++;
+		}
+	} else if (sparse2) {
+		for (s = 0; s < 32; s += (int)dec) {
+			uint8_t *o = out + (size_t)emitted * (size_t)unit;
+			uint16_t v = (uint16_t)lbytes[1][s] << 8;
 
-				memcpy(o, &v, 2);
-				emitted++;
-			}
-		} else {
-			for (s = 0; s < 32; s += (int)dec) {
-				uint8_t *o = out +
-					(size_t)emitted * (size_t)unit;
-
-				for (j = 0; j < unit; j++)
-					o[j] = lbytes[j][s];
-				emitted++;
-			}
+			memcpy(o, &v, 2);
+			emitted++;
 		}
 	} else {
 		for (s = 0; s < 32; s += (int)dec) {
-			if (p->samples_out + pending + (uint64_t)emitted >=
-			    p->limit_samples) {
-				p->limit_reached = 1;
-				break;
-			}
-			{
-				uint8_t *o = out + (size_t)emitted * (size_t)unit;
+			uint8_t *o = out + (size_t)emitted * (size_t)unit;
 
-				for (j = 0; j < unit; j++)
-					o[j] = lbytes[j][s];
-			}
+			for (j = 0; j < unit; j++)
+				o[j] = lbytes[j][s];
 			emitted++;
 		}
 	}
 
-	if (emitted > 0)
-		parser_write_out(p, out, (size_t)emitted * (size_t)unit);
+	return (size_t)emitted;
+}
+
+#if !defined(UHSIF_NO_THREADS)
+
+#define UHSIF_JOB_SNAPS		2048
+#define UHSIF_JOB_COUNT		4
+#define UHSIF_MAX_WORKERS	4
+
+enum uhsif_job_state {
+	JOB_FREE,
+	JOB_FILLING,
+	JOB_INFLIGHT,
+	JOB_DONE,
+};
+
+struct uhsif_job {
+	uint64_t seq;
+	int nsnap;
+	int state;
+	uint32_t in[UHSIF_JOB_SNAPS * VLLOGIC_NUM_CHANNELS];
+	uint8_t out[UHSIF_JOB_SNAPS * 100];
+};
+
+struct uhsif_workers {
+	struct uhsif_parser *parser;
+	unsigned int nthreads;
+	GThread *threads[UHSIF_MAX_WORKERS];
+	GMutex lock;
+	GCond cond;
+	struct uhsif_job jobs[UHSIF_JOB_COUNT];
+	uint64_t next_seq;
+	uint64_t commit_seq;
+	unsigned int work_head;
+	unsigned int job_snaps;
+	struct uhsif_job *fill_job;
+	size_t out_per_snap;
+	size_t out_stride;
+	int stop;
+};
+
+static gpointer expand_worker(gpointer arg)
+{
+	struct uhsif_workers *w = arg;
+	struct uhsif_parser *p = w->parser;
+
+	g_mutex_lock(&w->lock);
+	for (;;) {
+		struct uhsif_job *job;
+		unsigned int idx;
+		int i, nchan;
+
+		if (w->stop)
+			break;
+		if (w->work_head >= w->next_seq) {
+			g_cond_wait(&w->cond, &w->lock);
+			continue;
+		}
+		idx = w->work_head % UHSIF_JOB_COUNT;
+		job = &w->jobs[idx];
+		if (job->state != JOB_INFLIGHT) {
+			g_cond_wait(&w->cond, &w->lock);
+			continue;
+		}
+		w->work_head++;
+		g_mutex_unlock(&w->lock);
+
+		nchan = p->map->nchan;
+		for (i = 0; i < job->nsnap; i++)
+			(void)expand_snapshot_to(p,
+				job->in + (size_t)i * nchan,
+				job->out + (size_t)i * w->out_stride);
+
+		g_mutex_lock(&w->lock);
+		job->state = JOB_DONE;
+		g_cond_broadcast(&w->cond);
+	}
+	g_mutex_unlock(&w->lock);
+	return NULL;
+}
+
+/* Commit completed jobs in seq order; called on the parser thread only. */
+static void workers_drain(struct uhsif_parser *p)
+{
+	struct uhsif_workers *w = p->workers;
+	size_t unit = (size_t)p->map->unitsize;
+	size_t nout = w->out_per_snap / unit;
+
+	for (;;) {
+		struct uhsif_job *job;
+		uint64_t done, rem;
+
+		g_mutex_lock(&w->lock);
+		job = &w->jobs[w->commit_seq % UHSIF_JOB_COUNT];
+		if (job->state != JOB_DONE) {
+			g_mutex_unlock(&w->lock);
+			break;
+		}
+		g_mutex_unlock(&w->lock);
+
+		done = p->samples_out + p->out_len / unit;
+		rem = p->limit_samples ? p->limit_samples - done : UINT64_MAX;
+
+		{
+			size_t count = (size_t)job->nsnap * nout;
+
+			if (p->limit_samples && (uint64_t)count > rem) {
+				count = (size_t)rem;
+				p->limit_reached = 1;
+			}
+			if (count > 0)
+				parser_write_out(p, job->out, count * unit);
+		}
+
+		g_mutex_lock(&w->lock);
+		job->state = JOB_FREE;
+		w->commit_seq++;
+		g_cond_broadcast(&w->cond);
+		g_mutex_unlock(&w->lock);
+
+		if (p->limit_reached)
+			break;
+	}
+}
+
+static void workers_accept(struct uhsif_parser *p)
+{
+	struct uhsif_workers *w = p->workers;
+	int nchan = p->map->nchan;
+	struct uhsif_job *job;
+
+	if (p->limit_reached)
+		return;
+
+	if (!w->fill_job) {
+		for (;;) {
+			workers_drain(p);
+			g_mutex_lock(&w->lock);
+			job = &w->jobs[w->next_seq % UHSIF_JOB_COUNT];
+			if (job->state == JOB_FREE) {
+				job->state = JOB_FILLING;
+				job->nsnap = 0;
+				w->fill_job = job;
+				g_mutex_unlock(&w->lock);
+				break;
+			}
+			if (job->state == JOB_DONE) {
+				g_mutex_unlock(&w->lock);
+				continue;
+			}
+			g_cond_wait(&w->cond, &w->lock);
+			g_mutex_unlock(&w->lock);
+		}
+	}
+
+	job = w->fill_job;
+	memcpy(job->in + (size_t)job->nsnap * nchan,
+	       p->snap, (size_t)nchan * sizeof(uint32_t));
+	job->nsnap++;
+	if (job->nsnap >= (int)w->job_snaps) {
+		g_mutex_lock(&w->lock);
+		job->seq = w->next_seq++;
+		job->state = JOB_INFLIGHT;
+		g_cond_broadcast(&w->cond);
+		g_mutex_unlock(&w->lock);
+		w->fill_job = NULL;
+		workers_drain(p);
+	}
+}
+
+static void workers_finish(struct uhsif_parser *p)
+{
+	struct uhsif_workers *w = p->workers;
+	struct uhsif_job *job;
+	unsigned int i;
+
+	if (!w)
+		return;
+
+	g_mutex_lock(&w->lock);
+	job = w->fill_job;
+	if (job && job->nsnap > 0) {
+		job->seq = w->next_seq++;
+		job->state = JOB_INFLIGHT;
+		g_cond_broadcast(&w->cond);
+		w->fill_job = NULL;
+	}
+	g_mutex_unlock(&w->lock);
+
+	for (;;) {
+		struct uhsif_job *head;
+
+		workers_drain(p);
+		g_mutex_lock(&w->lock);
+		if (w->commit_seq == w->next_seq || p->limit_reached) {
+			g_mutex_unlock(&w->lock);
+			break;
+		}
+		head = &w->jobs[w->commit_seq % UHSIF_JOB_COUNT];
+		if (head->state == JOB_DONE) {
+			g_mutex_unlock(&w->lock);
+			continue;
+		}
+		g_cond_wait(&w->cond, &w->lock);
+		g_mutex_unlock(&w->lock);
+	}
+
+	g_mutex_lock(&w->lock);
+	w->stop = 1;
+	g_cond_broadcast(&w->cond);
+	g_mutex_unlock(&w->lock);
+	for (i = 0; i < w->nthreads; i++)
+		g_thread_join(w->threads[i]);
+	g_mutex_clear(&w->lock);
+	g_cond_clear(&w->cond);
+	g_free(w);
+	p->workers = NULL;
+}
+
+#else /* UHSIF_NO_THREADS */
+
+static void workers_accept(struct uhsif_parser *p) { (void)p; }
+static void workers_finish(struct uhsif_parser *p) { (void)p; }
+
+#endif
+
+static void emit_snapshot(struct uhsif_parser *p)
+{
+	uint8_t out[3 * 32 + 4];
+	size_t nout;
+	size_t unit = (size_t)p->map->unitsize;
+	uint64_t done, rem;
+
+	if (p->limit_reached)
+		return;
+	if (p->workers) {
+		workers_accept(p);
+		return;
+	}
+
+	nout = expand_snapshot_to(p, p->snap, out);
+
+	if (p->limit_samples != 0) {
+		done = p->samples_out + p->out_len / unit;
+		rem = done < p->limit_samples ? p->limit_samples - done : 0;
+		if ((uint64_t)nout > rem) {
+			nout = (size_t)rem;
+			p->limit_reached = 1;
+		}
+	}
+
+	if (nout > 0)
+		parser_write_out(p, out, nout * unit);
 
 	if (p->limit_samples != 0 && p->samples_out >= p->limit_samples)
 		p->limit_reached = 1;
 
-	/*
-	 * The sink coalesces snapshots into large chunks.  When the sample
-	 * limit is reached, the session must see the tail now, otherwise it
-	 * cannot observe samples_sent >= limit and never initiates STOP.
-	 */
 	if (p->limit_reached) {
 		parser_flush_out(p);
 		if (p->sink && p->sink->flush)
@@ -402,11 +642,70 @@ static void emit_snapshot(struct uhsif_parser *p)
 	}
 }
 
+int uhsif_parser_set_workers(struct uhsif_parser *p, unsigned int workers,
+		unsigned int job_snaps)
+{
+#if defined(UHSIF_NO_THREADS)
+	(void)p;
+	(void)workers;
+	(void)job_snaps;
+	return 0;
+#else
+	struct uhsif_workers *w;
+	unsigned int i;
+
+	if (!p || p->workers || workers < 1)
+		return 0;
+	if (workers > UHSIF_MAX_WORKERS)
+		workers = UHSIF_MAX_WORKERS;
+
+	(void)parser_avx2_available();
+
+	w = g_new0(struct uhsif_workers, 1);
+	w->parser = p;
+	w->nthreads = workers;
+	if (job_snaps < 1)
+		job_snaps = 1;
+	if (job_snaps > UHSIF_JOB_SNAPS)
+		job_snaps = UHSIF_JOB_SNAPS;
+	w->job_snaps = job_snaps;
+	w->out_per_snap = (size_t)(32 / p->decimate) *
+		(size_t)p->map->unitsize;
+	w->out_stride = w->out_per_snap;
+	g_mutex_init(&w->lock);
+	g_cond_init(&w->cond);
+	for (i = 0; i < UHSIF_JOB_COUNT; i++)
+		w->jobs[i].state = JOB_FREE;
+
+	for (i = 0; i < workers; i++) {
+		GError *err = NULL;
+
+		w->threads[i] = g_thread_try_new("vllogic-exp", expand_worker,
+				w, &err);
+		if (!w->threads[i]) {
+			g_clear_error(&err);
+			g_mutex_lock(&w->lock);
+			w->stop = 1;
+			g_cond_broadcast(&w->cond);
+			g_mutex_unlock(&w->lock);
+			while (i > 0)
+				g_thread_join(w->threads[--i]);
+			g_mutex_clear(&w->lock);
+			g_cond_clear(&w->cond);
+			g_free(w);
+			return -1;
+		}
+	}
+	p->workers = w;
+	return 0;
+#endif
+}
+
 static void parser_word(struct uhsif_parser *p, uint32_t w)
 {
 	p->st.payload_words++;
 
-	if (p->map->nchan == 1 && p->decimate == 1) {
+	if (!p->workers && p->map->nchan == 1 && p->decimate == 1) {
 		p->snap[0] = w;
 		emit_single_snapshot(p);
 		return;
@@ -628,6 +927,8 @@ void uhsif_parser_feed(struct uhsif_parser *p, const uint8_t *data, size_t len)
 
 void uhsif_parser_finish(struct uhsif_parser *p)
 {
+	workers_finish(p);
+
 	/* STOP truncated a block, so the last snapshot may be incomplete. */
 	if (p->snap_pos != 0) {
 		p->st.partial_snapshots++;

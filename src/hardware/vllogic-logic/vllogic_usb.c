@@ -679,11 +679,36 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 		unsigned int batch = UHSIF_OUT_BATCH_DEFAULT;
 		const char *env = getenv("VLLOGIC_BATCH_BYTES");
 
+		/* Lower rates need smaller packets to keep latency low. */
+		if (devc->samplerate <= 10000000ull)
+			batch = 256;
+		else if (devc->samplerate <= 100000000ull)
+			batch = 512;
 		if (env && *env)
 			batch = (unsigned int)strtoul(env, NULL, 10);
 		uhsif_parser_set_batch(&rx->parser, batch);
 		sr_info("parser: output batch %u bytes (max %u).",
 			rx->parser.batch_bytes, UHSIF_OUT_BATCH_MAX);
+	}
+	{
+		unsigned int ncpu = g_get_num_processors();
+		unsigned int workers = ncpu <= 2 ? 0 : 3;
+		unsigned int snaps = (map->nchan == 1 &&
+			map->unitsize == 1) ? 1024 : 2048;
+		const char *env = getenv("VLLOGIC_WORKERS");
+
+		if (env && *env)
+			workers = (unsigned int)strtoul(env, NULL, 10);
+		if (workers >= 2) {
+			if (uhsif_parser_set_workers(&rx->parser,
+					workers, snaps) != 0)
+				sr_warn("parser: failed to start %u "
+					"expansion workers; staying "
+					"single-threaded.", workers);
+			else
+				sr_info("parser: %u expansion workers, "
+					"%u snapshots/job.", workers, snaps);
+		}
 	}
 	return rx;
 }

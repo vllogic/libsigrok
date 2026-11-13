@@ -34,6 +34,8 @@
  * copy instead of the real thing.
  */
 
+#define UHSIF_NO_THREADS 1
+
 #include <stdio.h>
 #include <string.h>
 
