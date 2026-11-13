@@ -211,6 +211,13 @@ static void parser_write_out(struct uhsif_parser *p, const uint8_t *data,
 	p->out_len += (unsigned int)len;
 }
 
+static void parser_limit_done(struct uhsif_parser *p)
+{
+	parser_flush_out(p);
+	if (p->sink && p->sink->flush)
+		p->sink->flush(p->sink_user);
+}
+
 /**
  * Fast path for one logical lane with no decimation.
  *
@@ -222,6 +229,9 @@ static void parser_write_out(struct uhsif_parser *p, const uint8_t *data,
 static void emit_single_snapshot(struct uhsif_parser *p)
 {
 	uint32_t w = p->snap[0];
+
+	if (p->limit_reached)
+		return;
 	const struct vllogic_map *map = p->map;
 	int logical = map->phys2log[map->phys_list[0]];
 	int unit = map->unitsize;
@@ -254,9 +264,7 @@ static void emit_single_snapshot(struct uhsif_parser *p)
 
 		if (done >= p->limit_samples) {
 			p->limit_reached = 1;
-			parser_flush_out(p);
-			if (p->sink && p->sink->flush)
-				p->sink->flush(p->sink_user);
+			parser_limit_done(p);
 			return;
 		}
 		rem = p->limit_samples - done;
@@ -272,9 +280,7 @@ static void emit_single_snapshot(struct uhsif_parser *p)
 	    p->samples_out + p->out_len / (unsigned int)unit >=
 		    p->limit_samples) {
 		p->limit_reached = 1;
-		parser_flush_out(p);
-		if (p->sink && p->sink->flush)
-			p->sink->flush(p->sink_user);
+		parser_limit_done(p);
 	}
 }
 
@@ -283,8 +289,8 @@ static void emit_single_snapshot(struct uhsif_parser *p)
  * thread (single-threaded mode) and the expansion workers.  No limit or
  * sink handling here; the caller applies those to the returned count.
  *
- * out[] must provide room for 32 * unit + 4 bytes (the sparse unit=3 path
- * uses an overlapping 32-bit store).
+ * out[] must provide room for 32 * unit bytes.  Worker jobs use a
+ * stride of out_per_snap between snapshots.
  */
 static size_t expand_snapshot_to(struct uhsif_parser *p, const uint32_t *words,
 		uint8_t *out)
@@ -305,8 +311,18 @@ static size_t expand_snapshot_to(struct uhsif_parser *p, const uint32_t *words,
 		int logical = map->phys2log[map->phys_list[0]];
 		int lane = logical >> 3;
 		int bit = logical & 7;
+		uint64_t sm = (uint64_t)1 << bit;
 		size_t nout = (size_t)(32 / (int)dec);
 
+		if (unit == 1 && dec == 1) {
+			for (k = 0; k < 4; k++) {
+				uint64_t e = p->expand8[(w >> (k * 8)) &
+					0xFFu] * sm;
+
+				memcpy(out + k * 8, &e, 8);
+			}
+			return 32;
+		}
 		memset(out, 0, nout * (size_t)unit);
 		for (s = 0; s < 32; s += (int)dec) {
 			if (unit == 1)
@@ -355,9 +371,10 @@ static size_t expand_snapshot_to(struct uhsif_parser *p, const uint32_t *words,
 	if (sparse3) {
 		for (s = 0; s < 32; s += (int)dec) {
 			uint8_t *o = out + (size_t)emitted * (size_t)unit;
-			uint32_t v = (uint32_t)lbytes[2][s] << 16;
 
-			memcpy(o, &v, 4);
+			o[0] = 0;
+			o[1] = 0;
+			o[2] = lbytes[2][s];
 			emitted++;
 		}
 	} else if (sparse2) {
@@ -411,7 +428,7 @@ struct uhsif_workers {
 	struct uhsif_job jobs[UHSIF_JOB_COUNT];
 	uint64_t next_seq;
 	uint64_t commit_seq;
-	unsigned int work_head;
+	uint64_t work_head;
 	unsigned int job_snaps;
 	struct uhsif_job *fill_job;
 	size_t out_per_snap;
@@ -479,6 +496,11 @@ static void workers_drain(struct uhsif_parser *p)
 		g_mutex_unlock(&w->lock);
 
 		done = p->samples_out + p->out_len / unit;
+		if (p->limit_samples != 0 && done >= p->limit_samples) {
+			p->limit_reached = 1;
+			parser_limit_done(p);
+			break;
+		}
 		rem = p->limit_samples ? p->limit_samples - done : UINT64_MAX;
 
 		{
@@ -498,8 +520,10 @@ static void workers_drain(struct uhsif_parser *p)
 		g_cond_broadcast(&w->cond);
 		g_mutex_unlock(&w->lock);
 
-		if (p->limit_reached)
+		if (p->limit_reached) {
+			parser_limit_done(p);
 			break;
+		}
 	}
 }
 
@@ -747,8 +771,10 @@ static void parser_header(struct uhsif_parser *p)
 		 * "header" may contain the real next block header (a false
 		 * magic must not swallow it).
 		 */
-		p->snap_pos = 0;
-		p->st.partial_snapshots++;
+		if (p->snap_pos != 0) {
+			p->snap_pos = 0;
+			p->st.partial_snapshots++;
+		}
 		p->replay_len = UHSIF_HDR_SIZE - 1;
 		memcpy(p->replay, p->hdr + 1, p->replay_len);
 		p->state = 0;
@@ -769,6 +795,10 @@ static void parser_header(struct uhsif_parser *p)
 	}
 	if (plen < UHSIF_PAY_MIN || plen > UHSIF_PAY_MAX) {
 		p->st.bad_len++;
+		if (p->snap_pos != 0) {
+			p->snap_pos = 0;
+			p->st.partial_snapshots++;
+		}
 		p->state = 0;
 		return;
 	}
@@ -784,8 +814,13 @@ static void parser_header(struct uhsif_parser *p)
 	} else if (!p->hdr_drop) {
 		p->drop_active = 0;
 	}
-	if ((w1 & 0xFFFFFu) != p->map->mask)
+	if ((w1 & 0xFFFFFu) != p->map->mask) {
 		p->st.mask_mismatch++;
+		if (p->snap_pos != 0) {
+			p->snap_pos = 0;
+			p->st.partial_snapshots++;
+		}
+	}
 
 	p->pay_rem = plen;
 	p->state = 2;
@@ -813,10 +848,37 @@ static void parser_feed_raw(struct uhsif_parser *p, const uint8_t *data,
 		if (p->replay_len > 0) {
 			uint8_t tmp[UHSIF_HDR_SIZE];
 			unsigned int rl = p->replay_len;
+			size_t take = (size_t)UHSIF_HDR_SIZE - rl;
 
+			if (take > n)
+				take = n;
 			memcpy(tmp, p->replay, rl);
+			memcpy(tmp + rl, d, take);
 			p->replay_len = 0;
-			parser_feed_raw(p, tmp, (size_t)rl);
+			parser_feed_raw(p, tmp, (size_t)rl + take);
+			d += take;
+			n -= take;
+
+			/*
+			 * parser_feed_raw() may leave a partial header or
+			 * partial word in carry.  Stitch it with the current
+			 * input before scanning the rest, otherwise the
+			 * replay tail is lost or reordered.
+			 */
+			while (p->carry_len > 0 && n > 0) {
+				uint8_t ctmp[UHSIF_HDR_SIZE];
+				unsigned int cl = p->carry_len;
+				size_t ctake = (size_t)UHSIF_HDR_SIZE - cl;
+
+				if (ctake > n)
+					ctake = n;
+				memcpy(ctmp, p->carry, cl);
+				memcpy(ctmp + cl, d, ctake);
+				p->carry_len = 0;
+				parser_feed_raw(p, ctmp, (size_t)cl + ctake);
+				d += ctake;
+				n -= ctake;
+			}
 			continue;
 		}
 
@@ -1864,6 +1926,11 @@ int uhsif_selftest(int verbose)
 		{ "unit=3 ch19", { 19 }, 1, 0, 0, 0, 0, 0, 1 },
 		{ "unit=3 8ch mix", { 0, 1, 2, 3, 16, 17, 18, 19 }, 8,
 		  0, 0, 0, 0, 0, 1 },
+		{ "unit=3 sparse3", { 16, 19 }, 2, 0, 0, 0, 0, 0, 1 },
+		{ "unit=3 sparse3 dec2", { 16, 19 }, 2, 0, 0, 0, 0, 0, 2 },
+		{ "unit=2 sparse2", { 8, 12 }, 2, 0, 0, 0, 0, 0, 1 },
+		{ "unit=3 mixed 0,19", { 0, 19 }, 2, 0, 0, 0, 0, 0, 1 },
+		{ "unit=3 mixed 8,19", { 8, 19 }, 2, 0, 0, 0, 0, 0, 1 },
 		{ "unit=1 ch5 dec2", { 5 }, 1, 0, 0, 0, 0, 0, 2 },
 		{ "unit=1 8ch", { 0, 1, 2, 3, 4, 5, 6, 7 }, 8,
 		  0, 0, 0, 0, 0, 1 },

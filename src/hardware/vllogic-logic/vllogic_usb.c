@@ -117,6 +117,7 @@ struct vllogic_rx {
 	atomic_int fatal;
 	atomic_uint_fast64_t produced_bytes;	/* parser output, see limit */
 	atomic_uint_fast64_t blocks_seen;	/* CRC-valid blocks parsed */
+	atomic_uint_fast64_t data_blocks_seen;	/* CRC-valid data blocks */
 	atomic_int first_block_bad;
 	atomic_int abandoned;		/* teardown timed out, do not free */
 	unsigned int expected_div;
@@ -235,8 +236,10 @@ static void rx_sink_flush(void *user)
 	if (!c)
 		return;
 	rx->parser_cur = NULL;
-	if (c->len == 0)
+	if (c->len == 0) {
+		(void)ptr_push(&rx->chunk_free, c);
 		return;
+	}
 	if (ptr_push(&rx->chunk_filled, c) == 0)
 		return;
 	/* Session is behind: count the loss, but never lose the pointer. */
@@ -364,14 +367,22 @@ static void rx_notify(struct vllogic_rx *rx)
 
 static int urb_submit(struct vllogic_rx *rx, struct vllogic_urb *u)
 {
-	int ret = libusb_submit_transfer(u->xfer);
+	int ret;
 
-	if (ret == 0) {
-		atomic_store_explicit(&u->active, 1, memory_order_relaxed);
-		atomic_fetch_add_explicit(&rx->in_flight, 1,
+	/*
+	 * Account before submitting: libusb may invoke the completion
+	 * callback (from another thread's event loop) before
+	 * libusb_submit_transfer() returns.  in_flight must therefore
+	 * already cover this transfer.
+	 */
+	atomic_store_explicit(&u->active, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&rx->in_flight, 1, memory_order_relaxed);
+	ret = libusb_submit_transfer(u->xfer);
+	if (ret != 0) {
+		atomic_store_explicit(&u->active, 0, memory_order_relaxed);
+		atomic_fetch_sub_explicit(&rx->in_flight, 1,
 				memory_order_relaxed);
 	}
-
 	return ret;
 }
 
@@ -394,7 +405,7 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *t)
 		atomic_store_explicit(&rx->fatal, 1, memory_order_relaxed);
 	}
 
-	if (!atomic_load_explicit(&rx->stopping, memory_order_relaxed) &&
+	if (!atomic_load_explicit(&rx->stopping, memory_order_acquire) &&
 	    status != LIBUSB_TRANSFER_NO_DEVICE) {
 		struct vllogic_buf *nb;
 
@@ -441,7 +452,6 @@ static void LIBUSB_CALL in_cb(struct libusb_transfer *t)
 					ret = urb_submit(rx, u);
 					if (ret == 0)
 						break;
-					g_usleep(1000);
 				}
 				if (ret != 0) {
 					atomic_store_explicit(&rx->fatal, 1,
@@ -514,7 +524,37 @@ static gpointer event_thread(gpointer arg)
 
 		tv.tv_sec = 0;
 		tv.tv_usec = 10 * 1000;
-		libusb_handle_events_timeout(rx->usb_ctx, &tv);
+		{
+			int ret = libusb_handle_events_timeout(rx->usb_ctx, &tv);
+
+			if (ret == LIBUSB_ERROR_NO_DEVICE ||
+			    ret == LIBUSB_ERROR_IO) {
+				unsigned int j;
+
+				atomic_store_explicit(&rx->fatal, 1,
+						memory_order_relaxed);
+				for (j = 0; j < rx->urb_count; j++) {
+					if (atomic_load_explicit(
+							&rx->urbs[j].active,
+							memory_order_acquire))
+						libusb_cancel_transfer(
+							rx->urbs[j].xfer);
+				}
+			}
+			if (atomic_load_explicit(&rx->fatal,
+					memory_order_acquire)) {
+				unsigned int j;
+
+				for (j = 0; j < rx->urb_count; j++) {
+					if (atomic_load_explicit(
+							&rx->urbs[j].active,
+							memory_order_acquire))
+						break;
+				}
+				if (j == rx->urb_count)
+					break;
+			}
+		}
 	}
 
 	return NULL;
@@ -537,6 +577,9 @@ static gpointer parser_thread(gpointer arg)
 						it.len);
 			atomic_store_explicit(&rx->blocks_seen,
 					rx->parser.st.blocks,
+					memory_order_relaxed);
+			atomic_store_explicit(&rx->data_blocks_seen,
+					rx->parser.st.data_blocks,
 					memory_order_relaxed);
 			if (rx->parser.st.drop_blocks !=
 			    rx->last_drop_blocks) {
@@ -606,9 +649,12 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 	atomic_init(&rx->fatal, 0);
 	atomic_init(&rx->produced_bytes, 0);
 	atomic_init(&rx->blocks_seen, 0);
+	atomic_init(&rx->data_blocks_seen, 0);
 	atomic_init(&rx->first_block_bad, 0);
 	atomic_init(&rx->abandoned, 0);
 	atomic_init(&rx->dropped_bytes, 0);
+	atomic_init(&rx->dropped_chunks, 0);
+	atomic_init(&rx->drop_flag_events, 0);
 	rx->expected_div = devc->div;
 	rx->expected_mask = map->mask;
 	g_mutex_init(&rx->rx_mutex);
@@ -622,6 +668,10 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 	rx->urbs = g_malloc0(rx->urb_count * sizeof(*rx->urbs));
 	for (i = 0; i < rx->urb_count; i++) {
 		rx->urbs[i].xfer = libusb_alloc_transfer(0);
+		if (!rx->urbs[i].xfer) {
+			sr_err("Failed to allocate USB transfer %u.", i);
+			return NULL;
+		}
 		atomic_init(&rx->urbs[i].active, 0);
 	}
 
@@ -687,7 +737,8 @@ struct vllogic_rx *vllogic_rx_new(const struct sr_dev_inst *sdi,
 		if (env && *env)
 			batch = (unsigned int)strtoul(env, NULL, 10);
 		uhsif_parser_set_batch(&rx->parser, batch);
-		sr_info("parser: output batch %u bytes (max %u).",
+		sr_info("parser: output batch %u bytes (max %u; single-"
+			"thread path, workers submit job-sized blocks).",
 			rx->parser.batch_bytes, UHSIF_OUT_BATCH_MAX);
 	}
 	{
@@ -721,6 +772,11 @@ void vllogic_rx_free(struct vllogic_rx *rx)
 		return;
 
 	vllogic_rx_stop(rx);
+	/*
+	 * If rx_start() failed before the parser thread ran, finish() was
+	 * never called.  Stop the expansion workers here (idempotent).
+	 */
+	uhsif_parser_finish(&rx->parser);
 
 	/*
 	 * A timed-out teardown may still have URB callbacks referencing the
@@ -763,6 +819,11 @@ int vllogic_rx_start(struct vllogic_rx *rx)
 	int waited;
 
 	atomic_store_explicit(&rx->stopping, 0, memory_order_relaxed);
+	atomic_store_explicit(&rx->fatal, 0, memory_order_relaxed);
+	atomic_store_explicit(&rx->in_flight, 0, memory_order_relaxed);
+	atomic_store_explicit(&rx->abandoned, 0, memory_order_relaxed);
+	atomic_store_explicit(&rx->first_block_bad, 0, memory_order_relaxed);
+	atomic_store_explicit(&rx->produced_bytes, 0, memory_order_relaxed);
 	atomic_store_explicit(&rx->ev_exit, 0, memory_order_relaxed);
 	atomic_store_explicit(&rx->parser_exit, 0, memory_order_relaxed);
 	atomic_store_explicit(&rx->ev_ready, 0, memory_order_relaxed);
@@ -792,7 +853,7 @@ int vllogic_rx_start(struct vllogic_rx *rx)
 				break;
 			g_usleep(1000);
 		}
-		atomic_store_explicit(&rx->stopping, 1, memory_order_relaxed);
+		atomic_store_explicit(&rx->stopping, 1, memory_order_release);
 		for (waited = 0; waited < 2000; waited += 10) {
 			unsigned int i;
 
@@ -852,7 +913,7 @@ int vllogic_rx_start(struct vllogic_rx *rx)
 void vllogic_rx_set_stopping(struct vllogic_rx *rx)
 {
 	if (rx)
-		atomic_store_explicit(&rx->stopping, 1, memory_order_relaxed);
+		atomic_store_explicit(&rx->stopping, 1, memory_order_release);
 }
 
 void vllogic_rx_stop(struct vllogic_rx *rx)
@@ -878,27 +939,30 @@ void vllogic_rx_stop(struct vllogic_rx *rx)
 	 * threads at once.  Cancel everything once, then let the event
 	 * thread reap the completions (its loop runs every 10 ms).
 	 */
-	for (i = 0; i < rx->urb_count; i++) {
-		if (atomic_load_explicit(&rx->urbs[i].active,
-					 memory_order_relaxed))
-			libusb_cancel_transfer(rx->urbs[i].xfer);
-	}
 	for (waited = 0; waited < 5000; waited += 5) {
-		if (atomic_load_explicit(&rx->in_flight,
-					 memory_order_acquire) == 0)
+		int pending = 0;
+
+		for (i = 0; i < rx->urb_count; i++) {
+			if (!atomic_load_explicit(&rx->urbs[i].active,
+						  memory_order_acquire))
+				continue;
+			libusb_cancel_transfer(rx->urbs[i].xfer);
+			pending = 1;
+		}
+		if (!pending)
 			break;
 		g_usleep(5 * 1000);
 	}
-	if (atomic_load_explicit(&rx->in_flight, memory_order_acquire) != 0) {
-		sr_err("IN transfers still in flight after 5 s; marking the "
-			"receive pipeline abandoned (memory will be leaked).");
-		atomic_store_explicit(&rx->abandoned, 1, memory_order_relaxed);
-	}
-
 	atomic_store_explicit(&rx->ev_exit, 1, memory_order_relaxed);
 	g_thread_join(rx->ev_thread);
 	rx->ev_thread = NULL;
-	if (atomic_load_explicit(&rx->in_flight, memory_order_acquire) != 0) {
+	for (i = 0; i < rx->urb_count; i++) {
+		if (atomic_load_explicit(&rx->urbs[i].active,
+					 memory_order_acquire))
+			break;
+	}
+	if (i != rx->urb_count ||
+	    atomic_load_explicit(&rx->in_flight, memory_order_acquire) != 0) {
 		sr_err("IN transfers still active after joining the event "
 			"thread; marking the pipeline abandoned.");
 		atomic_store_explicit(&rx->abandoned, 1, memory_order_relaxed);
@@ -976,6 +1040,22 @@ uint64_t vllogic_rx_blocks(const struct vllogic_rx *rx)
 		return 0;
 
 	return atomic_load_explicit(&rx->blocks_seen, memory_order_relaxed);
+}
+
+/** CRC-valid data blocks (ACK-only blocks excluded), for the watchdog. */
+uint64_t vllogic_rx_data_blocks(const struct vllogic_rx *rx)
+{
+	if (!rx)
+		return 0;
+
+	return atomic_load_explicit(&rx->data_blocks_seen,
+			memory_order_relaxed);
+}
+
+int vllogic_rx_abandoned(const struct vllogic_rx *rx)
+{
+	return rx ? atomic_load_explicit(&rx->abandoned,
+			memory_order_acquire) : 0;
 }
 
 /**

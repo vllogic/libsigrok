@@ -76,6 +76,8 @@ static int vllogic_max_channels(uint64_t rate)
 	return VLLOGIC_NUM_CHANNELS;
 }
 
+static int vllogic_source_key(const struct sr_dev_inst *sdi);
+
 static const uint32_t scanopts[] = {
 	SR_CONF_CONN,
 };
@@ -289,6 +291,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		}
 
 		devc = g_malloc0(sizeof(*devc));
+		g_mutex_init(&devc->rx_mutex);
 		devc->div = VLLOGIC_DIV_MAX;
 		devc->decimate = 1;
 		devc->samplerate = VLLOGIC_CLOCK_HZ / devc->div;
@@ -306,6 +309,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		devc->usb_ctx = NULL;
 
 		sdi->priv = devc;
+		(void)vllogic_source_key(sdi);
 		sdi->status = SR_ST_INACTIVE;
 		sdi->inst_type = SR_INST_USB;
 		sdi->conn = sr_usb_dev_inst_new(libusb_get_bus_number(devlist[i]),
@@ -463,7 +467,7 @@ static uint64_t conf_link_limit(const struct sr_dev_inst *sdi)
 
 	if (speed == LIBUSB_SPEED_SUPER || speed == LIBUSB_SPEED_SUPER_PLUS)
 		limit = 400ull * 1000 * 1000;
-	else if (speed == LIBUSB_SPEED_HIGH)
+	else if (speed == LIBUSB_SPEED_HIGH || speed == LIBUSB_SPEED_UNKNOWN)
 		limit = 35ull * 1000 * 1000;
 
 	if (env && *env) {
@@ -527,6 +531,36 @@ static uint64_t conf_max_rate_for(const struct sr_dev_inst *sdi, int nchan)
  * Invalid values fall back to defaults one key at a time; a bandwidth
  * mismatch resets the whole group (the combination is what is invalid).
  */
+static int vllogic_source_key(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+
+	if (devc->source_key == 0) {
+		static gint next_key;
+
+		devc->source_key = -(g_atomic_int_add(&next_key, 1) + 0x1000);
+	}
+	return devc->source_key;
+}
+
+static void conf_defaults(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	GSList *l;
+
+	(void)conf_apply_rate(devc, VLLOGIC_CONF_DEFAULT_RATE);
+	devc->limit_samples = 0;
+	devc->pwm0 = VLLOGIC_PWM_DEFAULT0;
+	devc->pwm1 = VLLOGIC_PWM_DEFAULT1;
+	devc->cur_threshold = -2.5 + 83 * 0.05;
+	for (l = sdi->channels; l; l = l->next) {
+		struct sr_channel *ch = l->data;
+
+		if (ch->type == SR_CHANNEL_LOGIC)
+			ch->enabled = TRUE;
+	}
+}
+
 static void vllogic_conf_load(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -539,12 +573,15 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 	uint64_t rate;
 	gboolean fellback = FALSE;
 
-	if (conf_disabled())
+	if (conf_disabled()) {
+		conf_defaults(sdi);
 		return;
+	}
 
 	path = conf_path();
 	if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
 		sr_info("config: using defaults (no %s yet).", path);
+		conf_defaults(sdi);
 		g_free(path);
 		return;
 	}
@@ -556,6 +593,7 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 			path, err ? err->message : "unknown");
 		g_clear_error(&err);
 		g_key_file_free(kf);
+		conf_defaults(sdi);
 		g_free(path);
 		return;
 	}
@@ -617,7 +655,16 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 			"limit_samples", NULL);
 
 	/* threshold (per-key fallback) */
-	vth = g_key_file_get_double(kf, group, "threshold", NULL);
+	{
+		GError *terr = NULL;
+
+		vth = g_key_file_get_double(kf, group, "threshold", &terr);
+		if (terr) {
+			g_clear_error(&terr);
+			vth = -2.5 + 83 * 0.05;
+			fellback = TRUE;
+		}
+	}
 	if (!isfinite(vth) || vth < -2.5 || vth > 5.0) {
 		sr_warn("config: threshold %.3f V out of range; using 1.65 V.",
 			vth);
@@ -651,27 +698,16 @@ static void vllogic_conf_load(struct sr_dev_inst *sdi)
 
 		if (nchan > vllogic_max_channels(rate) ||
 		    !conf_bandwidth_ok(sdi, rate, nchan)) {
-			sr_warn("config: even %" G_GUINT64_FORMAT " Hz x %d ch "
-				"does not fit; enabling all %d channels.",
-				rate, nchan, VLLOGIC_NUM_CHANNELS);
-			for (i = 0; i < VLLOGIC_NUM_CHANNELS; i++)
-				want[i] = TRUE;
-			nchan = VLLOGIC_NUM_CHANNELS;
-			fellback = TRUE;
-
 			/*
-			 * Decimation cannot lower the wire rate (every
-			 * 1/2.5/5/10 MHz entry still runs at 20 MHz), so
-			 * the link cap may remain unsatisfied.  Leave the
-			 * settings as loaded and let the start-time check
-			 * refuse until the user cuts channels/rate.
+			 * Do not silently widen the channel selection:
+			 * that would only increase the required bandwidth.
+			 * Keep the user's channels and let the start-time
+			 * check refuse with a clear error.
 			 */
-			if (!conf_bandwidth_ok(sdi, rate, nchan))
-				sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch "
-					"still exceeds the link cap; capture "
-					"start will be refused until the channel "
-					"count or samplerate is reduced.",
-					rate, nchan);
+			sr_warn("config: %" G_GUINT64_FORMAT " Hz x %d ch "
+				"still exceeds the link cap; capture start "
+				"will be refused until the channel count or "
+				"samplerate is reduced.", rate, nchan);
 		}
 	}
 	devc->samplerate = rate;
@@ -705,6 +741,10 @@ static void vllogic_conf_save(struct sr_dev_inst *sdi)
 	chans = conf_channels_string(sdi);
 
 	kf = g_key_file_new();
+	if (g_file_test(path, G_FILE_TEST_EXISTS) &&
+	    !g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
+		sr_warn("config: cannot merge %s; other device groups may "
+			"be overwritten.", path);
 	g_key_file_set_integer(kf, group, "version", VLLOGIC_CONF_VERSION);
 	g_key_file_set_double(kf, group, "threshold",
 			((struct dev_context *)sdi->priv)->cur_threshold);
@@ -797,6 +837,7 @@ static int dev_close(struct sr_dev_inst *sdi)
 {
 	struct sr_usb_dev_inst *usb = sdi->conn;
 	struct dev_context *devc = sdi->priv;
+	gboolean skip_close = FALSE;
 
 	/* Closing an already closed device is a no-op, not a bug. */
 	if (!usb || !usb->devhdl)
@@ -841,22 +882,42 @@ static int dev_close(struct sr_dev_inst *sdi)
 				sr_warn("Capture did not finish within 5 s; "
 					"abandoning the receive pipeline from "
 					"dev_close() (no datafeed emitted).");
-				if (devc->rx) {
-					vllogic_rx_set_stopping(devc->rx);
-					vllogic_rx_stop(devc->rx);
-					vllogic_rx_free(devc->rx);
+				{
+					struct vllogic_rx *rx;
+
+					g_mutex_lock(&devc->rx_mutex);
+					rx = devc->rx;
 					devc->rx = NULL;
+					g_mutex_unlock(&devc->rx_mutex);
+					if (rx) {
+						vllogic_rx_set_stopping(rx);
+						vllogic_rx_stop(rx);
+						if (vllogic_rx_abandoned(rx))
+							devc->rx_abandoned = 1;
+						vllogic_rx_free(rx);
+					} else {
+						skip_close = TRUE;
+					}
 				}
 				atomic_store_explicit(&devc->state, VLLOGIC_IDLE,
 						memory_order_release);
 				if (sdi->session)
-					sr_session_source_remove(sdi->session, -1);
+					sr_session_source_remove(sdi->session,
+						vllogic_source_key(sdi));
 			}
 		}
 	} else if (devc && atomic_load_explicit(&devc->state, memory_order_relaxed) != VLLOGIC_IDLE) {
 		atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
 	}
 
+	if (devc && devc->rx_abandoned)
+		skip_close = TRUE;
+	if (skip_close) {
+		sr_err("Leaking the USB handle: in-flight transfers still "
+			"reference it.");
+		usb->devhdl = NULL;
+		return SR_OK;
+	}
 	libusb_release_interface(usb->devhdl, VLLOGIC_IFACE);
 	libusb_close(usb->devhdl);
 	usb->devhdl = NULL;
@@ -870,10 +931,17 @@ static void clear_private(void *priv)
 
 	if (!devc)
 		return;
-	if (devc->rx) {
-		vllogic_rx_free(devc->rx);
+	{
+		struct vllogic_rx *rx;
+
+		g_mutex_lock(&devc->rx_mutex);
+		rx = devc->rx;
 		devc->rx = NULL;
+		g_mutex_unlock(&devc->rx_mutex);
+		if (rx)
+			vllogic_rx_free(rx);
 	}
+	g_mutex_clear(&devc->rx_mutex);
 	/*
 	 * devc itself is released by std_dev_clear_with_callback(), which
 	 * calls g_free(sdi->priv) right after this callback returns.
@@ -927,10 +995,6 @@ static int config_get(uint32_t key, GVariant **data,
 		return SR_ERR_NA;
 	}
 
-	if (key == SR_CONF_SAMPLERATE || key == SR_CONF_LIMIT_SAMPLES ||
-	    key == SR_CONF_VOLTAGE_THRESHOLD)
-		vllogic_conf_save((struct sr_dev_inst *)sdi);
-
 	return SR_OK;
 }
 
@@ -966,6 +1030,24 @@ static int config_set(uint32_t key, GVariant *data,
 			sr_err("Unsupported samplerate %" PRIu64 " Hz; see "
 				"SR_CONF_SAMPLERATE list.", rate);
 			return SR_ERR_ARG;
+		}
+		{
+			int nchan = 0;
+			GSList *l;
+
+			for (l = sdi->channels; l; l = l->next) {
+				struct sr_channel *ch = l->data;
+
+				if (ch->type == SR_CHANNEL_LOGIC &&
+				    ch->enabled)
+					nchan++;
+			}
+			if (nchan > vllogic_max_channels(rate)) {
+				sr_err("Samplerate %" PRIu64 " Hz cannot "
+					"carry %d enabled channels.",
+					rate, nchan);
+				return SR_ERR_ARG;
+			}
 		}
 		if (atomic_load_explicit(&devc->state, memory_order_relaxed) != VLLOGIC_IDLE)
 			return SR_ERR;
@@ -1021,6 +1103,7 @@ static int config_set(uint32_t key, GVariant *data,
 		 * Send them without waiting for an ACK: the ACK would be
 		 * consumed by the capture path.
 		 */
+		g_mutex_lock(&devc->rx_mutex);
 		if (atomic_load_explicit(&devc->state, memory_order_relaxed) != VLLOGIC_IDLE && devc->rx) {
 			if (vllogic_send_simple(devc->rx,
 						UHSIF_CMD_VBIAS_PWM0, pwm0) !=
@@ -1028,11 +1111,13 @@ static int config_set(uint32_t key, GVariant *data,
 			    vllogic_send_simple(devc->rx,
 						UHSIF_CMD_VBIAS_PWM1, pwm1) !=
 			    SR_OK) {
+				g_mutex_unlock(&devc->rx_mutex);
 				sr_err("Failed to apply the threshold while "
 					"capturing.");
 				return SR_ERR;
 			}
 		}
+		g_mutex_unlock(&devc->rx_mutex);
 
 		devc->pwm0 = pwm0;
 		devc->pwm1 = pwm1;
@@ -1101,6 +1186,8 @@ static int config_list(uint32_t key, GVariant **data,
 /* Acquisition                                                               */
 /* ------------------------------------------------------------------------- */
 
+
+
 static void vllogic_begin_stop(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -1148,23 +1235,23 @@ static int vllogic_send_chunk(const struct sr_dev_inst *sdi,
 }
 
 /* Drain queued chunks, up to a byte budget. */
-static gsize vllogic_drain(const struct sr_dev_inst *sdi, gsize budget_max)
+static gsize vllogic_drain(const struct sr_dev_inst *sdi,
+		struct vllogic_rx *rx, gsize budget_max)
 {
-	struct dev_context *devc = sdi->priv;
 	gsize budget = 0;
 
-	while (devc->rx && budget < budget_max) {
+	while (rx && budget < budget_max) {
 		const uint8_t *data = NULL;
-		size_t len = vllogic_rx_pop(devc->rx, &data);
+		size_t len = vllogic_rx_pop(rx, &data);
 
 		if (len == 0)
 			break;
 		if (vllogic_send_chunk(sdi, data, len) != SR_OK) {
-			vllogic_rx_release(devc->rx);
+			vllogic_rx_release(rx);
 			break;
 		}
 		budget += len;
-		vllogic_rx_release(devc->rx);
+		vllogic_rx_release(rx);
 	}
 
 	return budget;
@@ -1174,22 +1261,30 @@ static gsize vllogic_drain(const struct sr_dev_inst *sdi, gsize budget_max)
 static void vllogic_finish(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
+	struct vllogic_rx *rx;
 	struct uhsif_stats st;
 	uint64_t dropped = 0;
 
-	if (!devc->rx) {
-		atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
+	g_mutex_lock(&devc->rx_mutex);
+	rx = devc->rx;
+	devc->rx = NULL;
+	g_mutex_unlock(&devc->rx_mutex);
+	if (!rx) {
+		atomic_store_explicit(&devc->state, VLLOGIC_IDLE,
+				memory_order_relaxed);
 		return;
 	}
 
 	/* Cancel the remaining IN transfers, join both threads. */
-	vllogic_rx_stop(devc->rx);
+	vllogic_rx_stop(rx);
+	if (vllogic_rx_abandoned(rx))
+		devc->rx_abandoned = 1;
 
 	/* The parser is gone: everything it produced is now queued. */
-	while (vllogic_drain(sdi, G_MAXSIZE) > 0)
+	while (vllogic_drain(sdi, rx, G_MAXSIZE) > 0)
 		;
 
-	vllogic_rx_get_stats(devc->rx, &st, &dropped);
+	vllogic_rx_get_stats(rx, &st, &dropped);
 	sr_info("Capture summary: blocks=%" G_GUINT64_FORMAT
 		" data=%" G_GUINT64_FORMAT " acks=%" G_GUINT64_FORMAT
 		" words=%" G_GUINT64_FORMAT " crc_fail=%" G_GUINT64_FORMAT
@@ -1207,10 +1302,10 @@ static void vllogic_finish(const struct sr_dev_inst *sdi)
 	sr_info("Capture teardown complete, sending SR_DF_END.");
 	(void)std_session_send_df_end(sdi);
 
-	vllogic_rx_free(devc->rx);
-	devc->rx = NULL;
+	vllogic_rx_free(rx);
 	atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
 }
+
 
 static int receive_data(int fd, int revents, void *cb_data)
 {
@@ -1234,15 +1329,22 @@ static int receive_data(int fd, int revents, void *cb_data)
 		}
 	}
 
-	(void)vllogic_drain(sdi, VLLOGIC_SEND_BUDGET);
-
-	if (atomic_load_explicit(&devc->state, memory_order_relaxed) == VLLOGIC_CAPTURING) {
+	{
 		char msg[160];
 
-		if (vllogic_rx_first_block_bad(devc->rx, msg, sizeof(msg))) {
+		if (atomic_load_explicit(&devc->state,
+				memory_order_relaxed) == VLLOGIC_CAPTURING &&
+		    vllogic_rx_first_block_bad(devc->rx, msg, sizeof(msg))) {
 			sr_err("%s", msg);
 			vllogic_begin_stop(sdi);
-		} else if (vllogic_rx_fatal(devc->rx)) {
+			return TRUE;
+		}
+	}
+
+	(void)vllogic_drain(sdi, devc->rx, VLLOGIC_SEND_BUDGET);
+
+	if (atomic_load_explicit(&devc->state, memory_order_relaxed) == VLLOGIC_CAPTURING) {
+		if (vllogic_rx_fatal(devc->rx)) {
 			sr_err("USB transfer failed, stopping the capture.");
 			vllogic_begin_stop(sdi);
 		} else if (devc->limit_samples != 0 &&
@@ -1253,7 +1355,7 @@ static int receive_data(int fd, int revents, void *cb_data)
 		} else if (devc->start_us != 0 &&
 			   g_get_monotonic_time() - devc->start_us >=
 			   (int64_t)G_TIME_SPAN_SECOND &&
-			   vllogic_rx_blocks(devc->rx) == 0) {
+			   vllogic_rx_data_blocks(devc->rx) == 0) {
 			sr_err("No CRC-valid block within 1000 ms of START; "
 				"the device is not streaming.");
 			vllogic_begin_stop(sdi);
@@ -1279,7 +1381,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	int ret;
 
 	if (atomic_load_explicit(&devc->state, memory_order_relaxed) != VLLOGIC_IDLE) {
-		sr_err("Acquisition already running.");
+		sr_err("Acquisition already running (state=%d).",
+			atomic_load_explicit(&devc->state, memory_order_relaxed));
 		return SR_ERR;
 	}
 
@@ -1319,10 +1422,19 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 	devc->samples_sent = 0;
-	devc->rx = vllogic_rx_new(sdi, &devc->map, devc->limit_samples);
-	if (!devc->rx) {
-		sr_err("Failed to allocate the receive pipeline.");
-		return SR_ERR;
+	devc->last_drop_events = 0;
+	devc->rx_abandoned = 0;
+	{
+		struct vllogic_rx *rx = vllogic_rx_new(sdi, &devc->map,
+				devc->limit_samples);
+
+		if (!rx) {
+			sr_err("Failed to allocate the receive pipeline.");
+			return SR_ERR;
+		}
+		g_mutex_lock(&devc->rx_mutex);
+		devc->rx = rx;
+		g_mutex_unlock(&devc->rx_mutex);
 	}
 
 	/*
@@ -1413,7 +1525,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 			const double calibration = 1.10;
 			const double link_ceiling = 400.0 * 1000 * 1000;
 #ifdef _WIN32
-			safety = 0.85;
+			safety = 0.95;
 #else
 			safety = 0.98;
 #endif
@@ -1495,7 +1607,8 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->start_us = g_get_monotonic_time();
 
 	/* Periodic source with a negative key: the fd slot is unused. */
-	ret = sr_session_source_add(sdi->session, -1, 0, VLLOGIC_POLL_MS,
+	ret = sr_session_source_add(sdi->session, vllogic_source_key(sdi),
+			0, VLLOGIC_POLL_MS,
 			receive_data, (void *)sdi);
 	if (ret != SR_OK) {
 		sr_err("Failed to add the session timer source.");
@@ -1523,9 +1636,15 @@ err_free:
 	 * only cleared devc->rx here, leaking 16 x 256 KiB URBs plus 256
 	 * chunks (12 MiB) on every failed start.
 	 */
-	if (devc->rx) {
-		vllogic_rx_free(devc->rx);
+	{
+		struct vllogic_rx *rx;
+
+		g_mutex_lock(&devc->rx_mutex);
+		rx = devc->rx;
 		devc->rx = NULL;
+		g_mutex_unlock(&devc->rx_mutex);
+		if (rx)
+			vllogic_rx_free(rx);
 	}
 	atomic_store_explicit(&devc->state, VLLOGIC_IDLE, memory_order_relaxed);
 	devc->start_us = 0;

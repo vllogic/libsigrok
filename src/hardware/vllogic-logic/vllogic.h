@@ -85,6 +85,9 @@ struct dev_context {
 	double cur_threshold;		/**< nominal threshold from the LIST grid */
 
 	atomic_int state;		/* set from the session thread, polled by dev_close() */
+	int source_key;			/**< Unique negative session source key. */
+	GMutex rx_mutex;		/**< Guards devc->rx replacement/free. */
+	int rx_abandoned;		/**< Last teardown could not reap UB. */
 	int64_t stop_deadline_us;
 	int64_t start_us;
 	uint64_t last_drop_events;
@@ -113,6 +116,8 @@ uint64_t vllogic_rx_drop_events(const struct vllogic_rx *rx);
 int vllogic_probe_link(struct vllogic_rx *rx, unsigned int window_ms,
 		uint64_t *bps);
 uint64_t vllogic_rx_blocks(const struct vllogic_rx *rx);
+uint64_t vllogic_rx_data_blocks(const struct vllogic_rx *rx);
+int vllogic_rx_abandoned(const struct vllogic_rx *rx);
 int vllogic_rx_first_block_bad(const struct vllogic_rx *rx, char *buf,
 		size_t buflen);
 
