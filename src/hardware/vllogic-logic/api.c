@@ -1015,24 +1015,12 @@ static int config_set(uint32_t key, GVariant *data,
 				"SR_CONF_SAMPLERATE list.", rate);
 			return SR_ERR_ARG;
 		}
-		{
-			int nchan = 0;
-			GSList *l;
-
-			for (l = sdi->channels; l; l = l->next) {
-				struct sr_channel *ch = l->data;
-
-				if (ch->type == SR_CHANNEL_LOGIC &&
-				    ch->enabled)
-					nchan++;
-			}
-			if (nchan > vllogic_max_channels(rate)) {
-				sr_err("Samplerate %" PRIu64 " Hz cannot "
-					"carry %d enabled channels.",
-					rate, nchan);
-				return SR_ERR_ARG;
-			}
-		}
+		/*
+		 * Do not validate the rate against the current channel set
+		 * here: libsigrok clients commonly set samplerate before they
+		 * change channels.  The start-time admission check is the
+		 * authoritative one and reports a clear error.
+		 */
 		if (atomic_load_explicit(&devc->state, memory_order_relaxed) != VLLOGIC_IDLE)
 			return SR_ERR;
 		devc->div = entry->div;
